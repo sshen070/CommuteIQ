@@ -1,0 +1,15 @@
+# Set up FastAPI
+fastapi
+uvicorn 
+sqlalchemy 
+psycopg2-binary
+
+# Create dataclass object (store fields)
+dataclasses
+datetime
+
+# Make API requests
+requests
+
+# Add entires to DB
+psycopg2
