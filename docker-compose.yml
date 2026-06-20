@@ -5,9 +5,9 @@ services:
     image: postgres:18
 
     environment:
-      POSTGRES_DB: commute_db
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
 
     ports:
       - "5432:5432"

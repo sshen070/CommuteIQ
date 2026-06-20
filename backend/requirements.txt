@@ -13,3 +13,6 @@ requests
 
 # Add entires to DB
 psycopg2
+
+# Read .env file
+dotenv
