@@ -2,7 +2,7 @@ import requests
 
 base_url: str = "https://api.tomtom.com/routing/1/calculateRoute/"
     
-def return_url(x1: str, y1: str, x2: str, y2: str, api_key: str) -> str:
+def return_url(x1: str, y1: str, x2: str, y2: str, api_key: str) -> dict:
     
     # Create base url
     coords: str = f'{x1},{y1}:{x2},{y2}' 
