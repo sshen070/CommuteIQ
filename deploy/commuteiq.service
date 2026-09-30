@@ -1,0 +1,30 @@
+# CommuteIQ collector: runs the Docker container whenever the server is up.
+#
+# Install:  sudo cp deploy/commuteiq.service /etc/systemd/system/
+#           sudo systemctl daemon-reload
+#           sudo systemctl enable --now commuteiq
+#
+# Stop:     sudo systemctl stop commuteiq            (starts again at next boot)
+# Disable:  sudo systemctl disable --now commuteiq   (stays off across reboots)
+# Status:   systemctl status commuteiq
+# Logs:     journalctl -u commuteiq -f
+
+[Unit]
+Description=CommuteIQ commute-time collector (Docker)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+# Repo location on the server; edit if it lives elsewhere
+WorkingDirectory=/opt/CommuteIQ
+
+# Runs in the foreground so logs go to journald; builds the image only if missing
+ExecStart=/usr/bin/docker compose up
+ExecStop=/usr/bin/docker compose down
+
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
