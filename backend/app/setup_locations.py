@@ -13,7 +13,6 @@ prompts = {
     "HOME": "Home",
     "UNI": "University (where you park / arrive)",
 }
-
 # Coordinates typed directly, e.g. "33.9695, -117.3327" (a pin copied from a map)
 coords_pattern = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$")
 

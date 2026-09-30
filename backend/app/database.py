@@ -1,4 +1,5 @@
 from dataclasses import replace
+from datetime import datetime
 from location import Location
 from pathlib import Path
 from trip_route import TripRoute
@@ -30,12 +31,19 @@ def create_tables(conn):
         id INTEGER PRIMARY KEY,
 
         role TEXT NOT NULL CHECK (role IN ('HOME', 'UNI')),
-        name TEXT,
+        name TEXT,                  -- user's label, or TomTom's POI name
         address TEXT NOT NULL,
         lat REAL NOT NULL,
         lon REAL NOT NULL,
 
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        -- Local ISO-8601 with UTC offset, set by add_location
+        created_at TEXT NOT NULL
+    );
+
+    -- Answers saved by setup, e.g. allow_tolls = '1'; a value in .env wins over these
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
     );
 
     -- One row per route query, in raw TomTom units (seconds, meters).
@@ -66,9 +74,13 @@ def create_tables(conn):
 
 
 def add_location(conn, role: str, place: Location) -> Location:
+
+    # Local time like commute_samples; SQLite's CURRENT_TIMESTAMP is always UTC
+    created_at = datetime.now().astimezone().isoformat(timespec="seconds")
+
     cur = conn.execute(
-        "INSERT INTO locations (role, name, address, lat, lon) VALUES (?, ?, ?, ?, ?)",
-        (role, place.name, place.address, place.lat, place.lon)
+        "INSERT INTO locations (role, name, address, lat, lon, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (role, place.name, place.address, place.lat, place.lon, created_at)
     )
     conn.commit()
 
@@ -89,6 +101,23 @@ def get_location(conn, role: str) -> Location | None:
     ).fetchone()
 
     return Location(*row) if row else None
+
+
+def get_setting(conn, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def set_setting(conn, key: str, value: str):
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        (key, value)
+    )
+    conn.commit()
+
+
+def has_samples(conn) -> bool:
+    return conn.execute("SELECT EXISTS (SELECT 1 FROM commute_samples)").fetchone()[0] == 1
 
 
 def add_sample(conn, origin: Location, destination: Location, route: TripRoute, allow_tolls: bool):

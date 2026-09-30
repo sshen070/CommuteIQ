@@ -1,22 +1,45 @@
 from data_extraction import fetch_route
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from trip_route import TripRoute
 
+import config
 import database
 import logging
 import os
+import re
 import sys
 import time
 
 # Minutes between samples; samples land on clock-aligned slots (:00, :05, :10, ...)
 interval_min: int = 5
 
+# START_AT in .env: 24-hour local HH:MM
+start_at_pattern = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+
 logger = logging.getLogger("commuteiq")
 
 
-def wait_for_next_slot():
+# Next clock-aligned slot strictly after now
+def next_slot(now: float) -> float:
     interval_s = interval_min * 60
-    target = (time.time() // interval_s + 1) * interval_s
+    return (now // interval_s + 1) * interval_s
+
+
+# Next local HH:MM: today if it's still ahead, otherwise tomorrow
+def next_start(start_at: str) -> float:
+    hour, minute = (int(part) for part in start_at.split(":"))
+
+    now = datetime.now()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+
+    # A naive local datetime converts via the OS, so DST changes are handled
+    return target.timestamp()
+
+
+def sleep_until(target: float):
 
     # Re-check after waking: a clock correction mid-sleep can end it early,
     # which would otherwise put two samples in one slot
@@ -69,19 +92,34 @@ def main():
     if home is None or uni is None:
         sys.exit("Home/university locations are not set. Run: python setup_locations.py")
 
-    # Toll Road OK?
-    allow_tolls = os.getenv("TOLL", "false").strip().lower() in ("1", "true", "yes")
+    # Toll Road OK? (TOLL in .env wins over the answer saved by setup)
+    allow_tolls, source = config.allow_tolls(conn)
 
     logger.info(f"Home: {home}")
     logger.info(f"Uni:  {uni}")
-    logger.info(f"Toll routes: {'sampled too (4 requests per slot)' if allow_tolls else 'skipped'}")
+    logger.info(f"Toll routes: {'sampled too (4 requests per slot)' if allow_tolls else 'skipped'} ({source})")
 
     # Both directions every interval
     legs = [(home, uni), (uni, home)]
 
+    # Optional delayed first sample, e.g. START_AT=00:00 so data begins on a clean day.
+    # Only for an empty database: after a restart mid-collection, resume right away
+    target = next_slot(time.time())
+
+    if start_at := config.env("START_AT"):
+        if not start_at_pattern.match(start_at):
+            sys.exit(f"START_AT must be 24-hour HH:MM, e.g. 00:00 (got {start_at!r})")
+
+        if database.has_samples(conn):
+            logger.info(f"START_AT={start_at} skipped: samples already exist, resuming collection")
+        else:
+            target = next_start(start_at)
+            logger.info(f"Waiting until {datetime.fromtimestamp(target):%a %Y-%m-%d %H:%M} to start (START_AT in .env)")
+
     while True:
-        wait_for_next_slot()
+        sleep_until(target)
         collect_samples(conn, legs, api_key, allow_tolls)
+        target = next_slot(time.time())
 
 
 if __name__ == "__main__":
