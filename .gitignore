@@ -1,2 +1,5 @@
 .env
+.venv/
 backend/app/__pycache__/
+data/
+CLAUDE.md
