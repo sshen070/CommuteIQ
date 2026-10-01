@@ -1,18 +1,9 @@
-# Set up FastAPI
+# Set up FastAPI (planned web API)
 fastapi
-uvicorn 
-sqlalchemy 
-psycopg2-binary
-
-# Create dataclass object (store fields)
-dataclasses
-datetime
+uvicorn
 
 # Make API requests
 requests
 
-# Add entires to DB
-psycopg2
-
 # Read .env file
-dotenv
+python-dotenv

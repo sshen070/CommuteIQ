@@ -1,41 +1,71 @@
+from location import Location
+from urllib.parse import quote
+
 import requests
 
-base_url: str = "https://api.tomtom.com/routing/1/calculateRoute/"
-    
-def return_url(x1: str, y1: str, x2: str, y2: str, api_key: str) -> dict:
-    
-    # Create base url
-    coords: str = f'{x1},{y1}:{x2},{y2}' 
-    base_path: str = f"{base_url}{coords}/json"
+routing_url: str = "https://api.tomtom.com/routing/1/calculateRoute/"
+search_url: str = "https://api.tomtom.com/search/2/"
 
-    # Create query ~ determine optimal path with no tollRoads
-    params = {
+# Seconds before giving up on a TomTom request
+timeout: int = 10
+
+
+def fetch_route(origin: Location, destination: Location, api_key: str, allow_tolls: bool = False) -> dict:
+
+    # Create base url
+    coords: str = f'{origin.lat},{origin.lon}:{destination.lat},{destination.lon}'
+    base_path: str = f"{routing_url}{coords}/json"
+
+    # Create query ~ determine optimal path (leaving now) with/without tollRoads
+    params: dict = {
         "key": api_key,
         "traffic": "true",
         "travelMode": "car",
         "routeType": "fastest",
-
-        # Avoid paid roads
-        "avoid": "tollRoads",
     }
 
-    # Make POST API call (response ~ request status)
-    response = requests.get(base_path, params=params)
+    # Avoid paid roads unless the user is fine with tolls
+    if not allow_tolls:
+        params["avoid"] = "tollRoads"
 
-    if response.status_code == 200:
-        route_data = response.json()
+    response = requests.get(base_path, params=params, timeout=timeout)
+    check_response(response)
 
-        routes = "routes"
-        summary = "summary"
+    # Route stats: travel time, traffic delay, distance, departure/arrival
+    return response.json()["routes"][0]["summary"]
 
-        # Print route stats
-        if routes in route_data:
-            if summary in route_data[routes][0]:
-                for entries in route_data[routes][0][summary]:
-                    print(f"{entries}: {route_data[routes][0][summary][entries]}")
 
-        route_stats = route_data[routes][0][summary]
-        return route_stats
+def search_places(query: str, api_key: str, limit: int = 5) -> list[Location]:
 
-    else:
-       print(f"Request failed! {response}")
+    # Fuzzy search matches addresses and POIs (e.g. parking lots), best match first
+    params = {"key": api_key, "limit": limit, "countrySet": "US"}
+
+    response = requests.get(f"{search_url}search/{quote(query, safe='')}.json", params=params, timeout=timeout)
+    check_response(response)
+
+    return [
+        Location(
+            address=result["address"].get("freeformAddress", ""),
+            lat=result["position"]["lat"],
+            lon=result["position"]["lon"],
+            name=result.get("poi", {}).get("name"),
+        )
+        for result in response.json()["results"]
+    ]
+
+
+def reverse_geocode(lat: float, lon: float, api_key: str) -> str | None:
+
+    # Nearest street address to a coordinate
+    response = requests.get(f"{search_url}reverseGeocode/{lat},{lon}.json", params={"key": api_key}, timeout=timeout)
+    check_response(response)
+
+    addresses = response.json()["addresses"]
+    return addresses[0]["address"].get("freeformAddress") if addresses else None
+
+
+def check_response(response):
+
+    # Report failures without the request URL, which contains the API key
+    if response.status_code != 200:
+        raise RuntimeError(f"TomTom request failed: HTTP {response.status_code} {response.text[:200]}")

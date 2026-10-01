@@ -1,13 +1,20 @@
-version: "3.9"
-
 services:
-  postgres:
-    image: postgres:18
+  collector:
+    build: .
+    image: commuteiq-collector
 
+    # TOMTOM_API_KEY comes from .env; it is never baked into the image
+    env_file: .env
     environment:
-      POSTGRES_DB: ${DB_NAME}
-      POSTGRES_USER: ${DB_USER}
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      DB_PATH: /app/data/commute.db
+      TZ: America/Los_Angeles     # log timestamps in local time
 
-    ports:
-      - "5432:5432"
+    # SQLite file lives on the host so it survives rebuilds
+    volumes:
+      - ./data:/app/data
+
+    # Forward stop signals to Python so shutdown is immediate
+    init: true
+
+    # systemd (deploy/commuteiq.service) owns starting, stopping and restarting
+    restart: "no"

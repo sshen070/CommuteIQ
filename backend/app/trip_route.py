@@ -20,6 +20,7 @@ class TripRoute:
     traffic_delay_min: float = field(init=False)
 
     departure_date: str = field(init=False)
+    departure_weekday: str = field(init=False)
     departure_time: str = field(init=False)
     departure_time_zone: str = field(init=False)
 
@@ -39,14 +40,16 @@ class TripRoute:
         self.travel_time_min = round(self.travelTimeInSeconds / min_to_sec, 2)
         self.traffic_delay_min = round(self.trafficDelayInSeconds / min_to_sec, 2)
 
-        # Parse timestamps
+        # Parse timestamps (TomTom reports local time at the origin)
         dep = datetime.fromisoformat(self.departureTime)
         arr = datetime.fromisoformat(self.arrivalTime)
 
+        # 24-hour HH:MM sorts and compares as text, e.g. BETWEEN '07:00' AND '09:00'
         self.departure_date = dep.strftime("%Y-%m-%d")
-        self.departure_time = dep.strftime("%H:%M:%S")
+        self.departure_weekday = dep.strftime("%A")
+        self.departure_time = dep.strftime("%H:%M")
         self.departure_time_zone = str(dep.tzinfo)
 
         self.arrival_date = arr.strftime("%Y-%m-%d")
-        self.arrival_time = arr.strftime("%H:%M:%S")
+        self.arrival_time = arr.strftime("%H:%M")
         self.arrival_time_zone = str(arr.tzinfo)
