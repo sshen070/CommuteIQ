@@ -95,6 +95,11 @@ def main():
     # Toll Road OK? (TOLL in .env wins over the answer saved by setup)
     allow_tolls, source = config.allow_tolls(conn)
 
+    # Which file and how much data: 0 samples after a switchover means the wrong database
+    sample_count = database.count_samples(conn)
+    db_file = conn.execute("PRAGMA database_list").fetchone()[2]
+
+    logger.info(f"Database: {db_file} ({sample_count:,} samples)")
     logger.info(f"Home: {home}")
     logger.info(f"Uni:  {uni}")
     logger.info(f"Toll routes: {'sampled too (4 requests per slot)' if allow_tolls else 'skipped'} ({source})")
@@ -110,11 +115,12 @@ def main():
         if not start_at_pattern.match(start_at):
             sys.exit(f"START_AT must be 24-hour HH:MM, e.g. 00:00 (got {start_at!r})")
 
-        if database.has_samples(conn):
-            logger.info(f"START_AT={start_at} skipped: samples already exist, resuming collection")
+        if sample_count:
+            logger.info(f"START_AT={start_at} skipped: samples already exist, resuming at the next 5-minute mark")
         else:
             target = next_start(start_at)
-            logger.info(f"Waiting until {datetime.fromtimestamp(target):%a %Y-%m-%d %H:%M} to start (START_AT in .env)")
+
+    logger.info(f"First sample at {datetime.fromtimestamp(target):%a %Y-%m-%d %H:%M}")
 
     while True:
         sleep_until(target)

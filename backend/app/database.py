@@ -116,8 +116,8 @@ def set_setting(conn, key: str, value: str):
     conn.commit()
 
 
-def has_samples(conn) -> bool:
-    return conn.execute("SELECT EXISTS (SELECT 1 FROM commute_samples)").fetchone()[0] == 1
+def count_samples(conn) -> int:
+    return conn.execute("SELECT COUNT(*) FROM commute_samples").fetchone()[0]
 
 
 def add_sample(conn, origin: Location, destination: Location, route: TripRoute, allow_tolls: bool):
