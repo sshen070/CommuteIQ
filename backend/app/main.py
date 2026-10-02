@@ -1,5 +1,5 @@
 from data_extraction import fetch_google_route, fetch_route
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from dotenv import load_dotenv
 from google_route import GoogleRoute
 from trip_route import TripRoute
@@ -19,11 +19,12 @@ interval_min: int = 5
 hh_mm = r"([01]?\d|2[0-3]):([0-5]\d)"
 start_at_pattern = re.compile(rf"^{hh_mm}$")
 
-# Google Routes is free for only 5,000 requests a month, so unlike TomTom it samples
-# weekday windows, toll-free only. The defaults cover 05:00-21:00 with 216 requests per
-# weekday: 4,968 in a 23-weekday month, the longest there is. Override in .env with
-# GOOGLE_HOME_TO_UNI / GOOGLE_UNI_TO_HOME as local HH:MM-HH:MM, or "off"
-google_windows: dict[tuple[str, str], str] = {
+# Commute windows per direction, shared by TomTom and Google so their samples pair up.
+# Override in .env with WINDOW_HOME_TO_UNI / WINDOW_UNI_TO_HOME as local HH:MM-HH:MM,
+# or "off" to stop sampling that direction. The defaults cover 05:00-21:00 with 216
+# slots a day, which fits both free tiers: up to 13,392 TomTom requests (with toll
+# routes, 31-day month) and 4,968 Google requests (weekdays, 23-weekday month)
+default_windows: dict[tuple[str, str], str] = {
     ("HOME", "UNI"): "05:00-14:00",
     ("UNI", "HOME"): "12:00-21:00",
 }
@@ -32,7 +33,6 @@ window_pattern = re.compile(rf"^{hh_mm}\s*-\s*{hh_mm}$")
 # PESSIMISTIC = "longer than actual on most days", the upper bound to TomTom's estimate.
 # Each model added (e.g. BEST_GUESS, Google's typical case) adds that many requests again
 google_traffic_models: list[str] = ["PESSIMISTIC"]
-max_weekdays_per_month: int = 23
 
 logger = logging.getLogger("commuteiq")
 
@@ -96,54 +96,10 @@ def collect_samples(conn, legs, api_key: str, allow_tolls: bool = False):
                 logger.error(f"{leg} failed: {str(err).replace(api_key, '***')}")
 
 
-# A leg's Google window as minutes after midnight [start, end), or None if "off"
-def google_window(origin, destination) -> tuple[int, int] | None:
-    name = f"GOOGLE_{origin.role}_TO_{destination.role}"
-    value = config.env(name) or google_windows[(origin.role, destination.role)]
-
-    if value.lower() == "off":
-        return None
-
-    if not (match := window_pattern.match(value)):
-        sys.exit(f"{name} must be 24-hour HH:MM-HH:MM, e.g. 06:00-10:00, or off (got {value!r})")
-
-    start_h, start_m, end_h, end_m = (int(part) for part in match.groups())
-    start, end = start_h * 60 + start_m, end_h * 60 + end_m
-
-    if start >= end:
-        sys.exit(f"{name} must end after it starts, within one day (got {value!r})")
-
-    return start, end
-
-
-# 390 -> "06:30"
-def clock(minutes: int) -> str:
-    return f"{minutes // 60:02}:{minutes % 60:02}"
-
-
-# Google requests per weekday from the windows; a month has 20-23 weekdays
-def google_requests_per_weekday(google_legs) -> int:
-    slots = sum(
-        start <= minute < end
-        for _, _, (start, end) in google_legs
-        for minute in range(0, 24 * 60, interval_min)
-    )
-    return slots * len(google_traffic_models)
-
-
-def collect_google_samples(conn, google_legs, api_key: str, slot: datetime):
-
-    # Weekdays only: classes are Mon-Fri, and the free allowance is tight
-    if slot.weekday() >= 5:
-        return
-
-    minute = slot.hour * 60 + slot.minute
+def collect_google_samples(conn, legs, api_key: str):
     limit = config.google_monthly_limit
 
-    for origin, destination, (start, end) in google_legs:
-        if not start <= minute < end:
-            continue
-
+    for origin, destination in legs:
         for model in google_traffic_models:
             leg = f"{origin.role} -> {destination.role} [Google {model.lower()}]"
 
@@ -176,6 +132,54 @@ def collect_google_samples(conn, google_legs, api_key: str, slot: datetime):
                 logger.error(f"{leg} failed: {str(err).replace(api_key, '***')}")
 
 
+# A direction's window as minutes after midnight [start, end), or None if "off"
+def window(origin, destination) -> tuple[int, int] | None:
+    name = f"WINDOW_{origin.role}_TO_{destination.role}"
+    value = config.env(name) or default_windows[(origin.role, destination.role)]
+
+    if value.lower() == "off":
+        return None
+
+    if not (match := window_pattern.match(value)):
+        sys.exit(f"{name} must be 24-hour HH:MM-HH:MM, e.g. 06:00-10:00, or off (got {value!r})")
+
+    start_h, start_m, end_h, end_m = (int(part) for part in match.groups())
+    start, end = start_h * 60 + start_m, end_h * 60 + end_m
+
+    if start >= end:
+        sys.exit(f"{name} must end after it starts, within one day (got {value!r})")
+
+    return start, end
+
+
+# 390 -> "06:30"
+def clock(minutes: int) -> str:
+    return f"{minutes // 60:02}:{minutes % 60:02}"
+
+
+# (origin, destination) pairs whose window contains this slot
+def legs_in_window(windowed_legs, slot: datetime) -> list:
+    minute = slot.hour * 60 + slot.minute
+    return [(o, d) for o, d, w in windowed_legs if w and w[0] <= minute < w[1]]
+
+
+# Slots a day inside the windows, each direction counted separately
+def window_slots(windowed_legs) -> int:
+    windows = [w for _, _, w in windowed_legs if w]
+    return sum(start <= minute < end for start, end in windows for minute in range(0, 24 * 60, interval_min))
+
+
+# TOMTOM_ALL_DAY_UNTIL=YYYY-MM-DD: last local date TomTom samples around the clock
+def tomtom_all_day_until() -> date | None:
+    if not (value := config.env("TOMTOM_ALL_DAY_UNTIL")):
+        return None
+
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        sys.exit(f"TOMTOM_ALL_DAY_UNTIL must be a date like 2026-10-06 (got {value!r})")
+
+
 def main():
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -199,36 +203,50 @@ def main():
     logger.info(f"Database: {db_file} ({sample_count:,} samples)")
     logger.info(f"Home: {home}")
     logger.info(f"Uni:  {uni}")
-    logger.info(f"TomTom toll routes: {'sampled too (4 requests per slot)' if allow_tolls else 'skipped'} ({source})")
+    logger.info(f"TomTom toll routes: {'sampled too (2 requests per direction)' if allow_tolls else 'skipped'} ({source})")
 
-    # Both directions every interval
-    legs = [(home, uni), (uni, home)]
+    # Both directions, each with its window
+    windowed_legs = [(o, d, window(o, d)) for o, d in [(home, uni), (uni, home)]]
+    all_legs = [(o, d) for o, d, _ in windowed_legs]
+    slots = window_slots(windowed_legs)
 
-    # Google as a pessimistic upper bound, within each direction's window
+    windows = ", ".join(f"{o.role} -> {d.role} {f'{clock(w[0])}-{clock(w[1])}' if w else 'off'}" for o, d, w in windowed_legs)
+    logger.info(f"Windows: {windows}")
+
+    # TomTom can run around the clock first (e.g. a baseline week), then keeps to the windows.
+    # Worst case is a 31-day month
+    all_day_until = tomtom_all_day_until()
+    tomtom_most = slots * (2 if allow_tolls else 1) * config.max_days_per_month
+
+    if all_day_until and all_day_until >= date.today():
+        logger.info(f"TomTom: around the clock through {all_day_until:%a %Y-%m-%d}, then inside the windows every day")
+    else:
+        logger.info("TomTom: inside the windows every day")
+
+    logger.info(f"TomTom windows need up to {tomtom_most:,} of {config.tomtom_free_per_month:,} free requests a month")
+    if tomtom_most > config.tomtom_free_per_month:
+        logger.warning("Over TomTom's free allowance: samples will fail late in long months. Narrow the WINDOW_* settings in .env")
+
+    # Google as a pessimistic upper bound, weekdays inside the windows. Worst case is a
+    # 23-weekday month; beyond the limit, requests are refused, not billed
     google_key = config.env("GOOGLE_CLOUD_API_KEY")
-    google_legs = []
 
-    if google_key:
-        google_legs = [(o, d, window) for o, d in legs if (window := google_window(o, d))]
-
-    if google_legs:
-        windows = ", ".join(f"{o.role} -> {d.role} {clock(start)}-{clock(end)}" for o, d, (start, end) in google_legs)
+    if google_key and slots:
         models = ", ".join(model.lower() for model in google_traffic_models)
         limit = config.google_monthly_limit
 
-        # Worst case is a 23-weekday month; beyond the limit, requests are refused, not billed
-        most = google_requests_per_weekday(google_legs) * max_weekdays_per_month
+        google_most = slots * len(google_traffic_models) * config.max_weekdays_per_month
         used = database.requests_this_month(conn, "google_routes")
 
-        logger.info(f"Google Routes: {windows} on weekdays, toll-free, {models}")
-        logger.info(f"Google usage: {used:,} of {limit:,} free requests this month; up to {most:,} per month at these windows")
+        logger.info(f"Google Routes: inside the windows on weekdays, toll-free, {models}")
+        logger.info(f"Google usage: {used:,} of {limit:,} free requests this month; up to {google_most:,} a month at these windows")
 
         if used >= limit:
             logger.warning("Google free allowance used up: no more Google samples this month")
-        if most > limit:
+        if google_most > limit:
             logger.warning(
-                f"Windows can need {most:,} requests in a month, over the {limit:,} limit: "
-                "Google samples stop when it's reached. Narrow the GOOGLE_* windows in .env"
+                f"Windows can need {google_most:,} Google requests in a month, over the {limit:,} limit: "
+                "Google samples stop when it's reached. Narrow the WINDOW_* settings in .env"
             )
     else:
         logger.info(f"Google Routes: off ({'all windows off' if google_key else 'no GOOGLE_CLOUD_API_KEY in .env'})")
@@ -250,8 +268,17 @@ def main():
 
     while True:
         sleep_until(target)
-        collect_samples(conn, legs, api_key, allow_tolls)
-        collect_google_samples(conn, google_legs, google_key, datetime.fromtimestamp(target))
+        slot = datetime.fromtimestamp(target)
+        in_window = legs_in_window(windowed_legs, slot)
+
+        # TomTom: every slot through TOMTOM_ALL_DAY_UNTIL, then only inside the windows
+        all_day = all_day_until is not None and slot.date() <= all_day_until
+        collect_samples(conn, all_legs if all_day else in_window, api_key, allow_tolls)
+
+        # Google: weekdays only (classes are Mon-Fri, and its free allowance is tight)
+        if google_key and slot.weekday() < 5:
+            collect_google_samples(conn, in_window, google_key)
+
         target = next_slot(time.time())
 
 
