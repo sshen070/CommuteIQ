@@ -30,9 +30,12 @@ default_windows: dict[tuple[str, str], str] = {
 }
 window_pattern = re.compile(rf"^{hh_mm}\s*-\s*{hh_mm}$")
 
-# PESSIMISTIC = "longer than actual on most days", the upper bound to TomTom's estimate.
-# Each model added (e.g. BEST_GUESS, Google's typical case) adds that many requests again
-google_traffic_models: list[str] = ["PESSIMISTIC"]
+# Google queries per direction and slot, as (traffic model, tolls allowed); each is one
+# request. PESSIMISTIC = "longer than actual on most days", the upper bound to TomTom's
+# estimate. BEST_GUESS = Google's typical estimate, also with tolls to compare with
+# TomTom's toll routes. Those two only run while trial credits pay past the free 5,000
+google_free_queries: list[tuple[str, bool]] = [("PESSIMISTIC", False)]
+google_credit_queries: list[tuple[str, bool]] = [("PESSIMISTIC", False), ("BEST_GUESS", False), ("BEST_GUESS", True)]
 
 logger = logging.getLogger("commuteiq")
 
@@ -74,7 +77,8 @@ def collect_samples(conn, legs, api_key: str, allow_tolls: bool = False):
             leg = f"{origin.role} -> {destination.role}{' (tolls)' if tolls else ''}"
 
             try:
-                # Run query (fetch current travel time with live traffic)
+                # Run query (fetch current travel time with live traffic), counted first
+                database.record_request(conn, "tomtom_routing")
                 route_data: dict = fetch_route(origin, destination, api_key, tolls)
 
                 route: TripRoute = TripRoute(
@@ -96,25 +100,23 @@ def collect_samples(conn, legs, api_key: str, allow_tolls: bool = False):
                 logger.error(f"{leg} failed: {str(err).replace(api_key, '***')}")
 
 
-def collect_google_samples(conn, legs, api_key: str):
-    limit = config.google_monthly_limit
+def collect_google_samples(conn, legs, api_key: str, queries: list[tuple[str, bool]], limit: int):
 
     for origin, destination in legs:
-        for model in google_traffic_models:
-            leg = f"{origin.role} -> {destination.role} [Google {model.lower()}]"
+        for model, tolls in queries:
+            leg = f"{origin.role} -> {destination.role}{' (tolls)' if tolls else ''} [Google {model.lower()}]"
 
             try:
-                # Past the free allowance, skip quietly: the warning was logged when it was reached
+                # Past the monthly limit, skip quietly: the warning was logged when it was reached
                 if (used := database.use_request(conn, "google_routes", limit)) is None:
                     continue
                 if used == limit:
-                    logger.warning(f"Google free allowance used up ({limit:,} requests): no more Google samples this month")
+                    logger.warning(f"Google monthly limit reached ({limit:,} requests): no more Google samples this month")
 
                 # Google reports no departure time, so record when the request is sent
                 departure_at = datetime.now().astimezone().isoformat(timespec="seconds")
 
-                # Toll-free only, to match TomTom's always-sampled toll-free route
-                route_data: dict = fetch_google_route(origin, destination, api_key, False, model)
+                route_data: dict = fetch_google_route(origin, destination, api_key, tolls, model)
 
                 route: GoogleRoute = GoogleRoute(
                     duration=route_data["duration"],
@@ -124,7 +126,7 @@ def collect_google_samples(conn, legs, api_key: str):
                     departureTime=departure_at
                 )
 
-                database.add_google_sample(conn, origin, destination, route, False)
+                database.add_google_sample(conn, origin, destination, route, tolls)
                 logger.info(f"{leg}: {route.travel_time_min} min")
 
             # Same rule as TomTom: log and keep collecting
@@ -169,15 +171,45 @@ def window_slots(windowed_legs) -> int:
     return sum(start <= minute < end for start, end in windows for minute in range(0, 24 * 60, interval_min))
 
 
-# TOMTOM_ALL_DAY_UNTIL=YYYY-MM-DD: last local date TomTom samples around the clock
-def tomtom_all_day_until() -> date | None:
-    if not (value := config.env("TOMTOM_ALL_DAY_UNTIL")):
+# A local YYYY-MM-DD date from .env (TOMTOM_ALL_DAY_UNTIL, GOOGLE_CREDITS_UNTIL), or None
+def env_date(name: str) -> date | None:
+    if not (value := config.env(name)):
         return None
 
     try:
         return date.fromisoformat(value)
     except ValueError:
-        sys.exit(f"TOMTOM_ALL_DAY_UNTIL must be a date like 2026-10-06 (got {value!r})")
+        sys.exit(f"{name} must be a date like 2026-10-06 (got {value!r})")
+
+
+# Google queries and monthly request limit for a day: while trial credits last, the
+# credit queries, with the excess past the free 5,000 paid from the credits
+def google_plan(day: date, credits_until: date | None) -> tuple[list[tuple[str, bool]], int]:
+    if credits_until is not None and day <= credits_until:
+        return google_credit_queries, config.google_credit_monthly_limit
+
+    return google_free_queries, config.google_monthly_limit
+
+
+# [("BEST_GUESS", True)] -> "best_guess (tolls)"
+def describe(queries: list[tuple[str, bool]]) -> str:
+    return ", ".join(f"{model.lower()}{' (tolls)' if tolls else ''}" for model, tolls in queries)
+
+
+# Startup line for a Google plan: queries, worst-case month at these windows, cost from credits
+def log_google_plan(label: str, queries: list[tuple[str, bool]], limit: int, slots: int):
+    most = slots * len(queries) * config.max_weekdays_per_month
+    paid = max(0, min(most, limit) - config.google_monthly_limit) * config.google_price_per_1000 / 1000
+
+    logger.info(
+        f"Google {label}: {describe(queries)}, up to {most:,} requests a month, "
+        f"limit {limit:,}" + (f" (up to ${paid:,.0f} a month from trial credits)" if paid else "")
+    )
+    if most > limit:
+        logger.warning(
+            f"Windows can need {most:,} Google requests in a month, over the {limit:,} limit: "
+            "Google samples stop when it's reached. Narrow the WINDOW_* settings in .env"
+        )
 
 
 def main():
@@ -215,7 +247,7 @@ def main():
 
     # TomTom can run around the clock first (e.g. a baseline week), then keeps to the windows.
     # Worst case is a 31-day month
-    all_day_until = tomtom_all_day_until()
+    all_day_until = env_date("TOMTOM_ALL_DAY_UNTIL")
     tomtom_most = slots * (2 if allow_tolls else 1) * config.max_days_per_month
 
     if all_day_until and all_day_until >= date.today():
@@ -223,31 +255,35 @@ def main():
     else:
         logger.info("TomTom: inside the windows every day")
 
-    logger.info(f"TomTom windows need up to {tomtom_most:,} of {config.tomtom_free_per_month:,} free requests a month")
+    database.backfill_tomtom_usage(conn)
+    tomtom_used = database.requests_this_month(conn, "tomtom_routing")
+
+    logger.info(
+        f"TomTom usage: {tomtom_used:,} requests this month; windows need up to {tomtom_most:,} "
+        f"of {config.tomtom_free_per_month:,} free a month"
+    )
     if tomtom_most > config.tomtom_free_per_month:
         logger.warning("Over TomTom's free allowance: samples will fail late in long months. Narrow the WINDOW_* settings in .env")
 
-    # Google as a pessimistic upper bound, weekdays inside the windows. Worst case is a
-    # 23-weekday month; beyond the limit, requests are refused, not billed
+    # Google as an upper bound (plus BEST_GUESS while trial credits last), weekdays inside
+    # the windows. Worst case is a 23-weekday month; past the limit, requests are refused
     google_key = config.env("GOOGLE_CLOUD_API_KEY")
+    credits_until = env_date("GOOGLE_CREDITS_UNTIL")
+    on_credits = credits_until is not None and date.today() <= credits_until
 
     if google_key and slots:
-        models = ", ".join(model.lower() for model in google_traffic_models)
-        limit = config.google_monthly_limit
-
-        google_most = slots * len(google_traffic_models) * config.max_weekdays_per_month
         used = database.requests_this_month(conn, "google_routes")
+        logger.info(f"Google Routes: inside the windows on weekdays ({used:,} requests used this month)")
 
-        logger.info(f"Google Routes: inside the windows on weekdays, toll-free, {models}")
-        logger.info(f"Google usage: {used:,} of {limit:,} free requests this month; up to {google_most:,} a month at these windows")
+        if on_credits:
+            log_google_plan(f"through {credits_until:%a %Y-%m-%d} (trial credits)", google_credit_queries,
+                            config.google_credit_monthly_limit, slots)
+            log_google_plan("after that", google_free_queries, config.google_monthly_limit, slots)
+        else:
+            log_google_plan("(free tier)", google_free_queries, config.google_monthly_limit, slots)
 
-        if used >= limit:
-            logger.warning("Google free allowance used up: no more Google samples this month")
-        if google_most > limit:
-            logger.warning(
-                f"Windows can need {google_most:,} Google requests in a month, over the {limit:,} limit: "
-                "Google samples stop when it's reached. Narrow the WINDOW_* settings in .env"
-            )
+        if used >= google_plan(date.today(), credits_until)[1]:
+            logger.warning("Google monthly limit reached: no more Google samples this month")
     else:
         logger.info(f"Google Routes: off ({'all windows off' if google_key else 'no GOOGLE_CLOUD_API_KEY in .env'})")
 
@@ -275,9 +311,17 @@ def main():
         all_day = all_day_until is not None and slot.date() <= all_day_until
         collect_samples(conn, all_legs if all_day else in_window, api_key, allow_tolls)
 
-        # Google: weekdays only (classes are Mon-Fri, and its free allowance is tight)
+        # When trial credits end, Google drops to the free plan, whose limit may already be
+        # used up this month; say so once, since its requests then stop without errors
+        if on_credits and slot.date() > credits_until:
+            on_credits = False
+            logger.info(f"Google trial credits ended: {describe(google_free_queries)} only, "
+                        f"limit {config.google_monthly_limit:,} a month")
+
+        # Google: weekdays only (classes are Mon-Fri, and its allowance is tight)
         if google_key and slot.weekday() < 5:
-            collect_google_samples(conn, in_window, google_key)
+            queries, limit = google_plan(slot.date(), credits_until)
+            collect_google_samples(conn, in_window, google_key, queries, limit)
 
         target = next_slot(time.time())
 

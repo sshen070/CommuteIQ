@@ -22,6 +22,7 @@ def find_candidates(conn, query: str, api_key: str) -> list[Location]:
 
     if match:
         lat, lon = float(match[1]), float(match[2])
+        database.record_request(conn, "tomtom_reverse_geocode")
         address = reverse_geocode(lat, lon, api_key) or query
         return [Location(address=address, lat=lat, lon=lon)]
 
@@ -35,6 +36,7 @@ def find_candidates(conn, query: str, api_key: str) -> list[Location]:
         except Exception as err:
             print(f"  Google search failed, using TomTom: {str(err).replace(google_key, '***')}")
 
+    database.record_request(conn, "tomtom_search")
     return search_places(query, api_key)
 
 

@@ -97,10 +97,10 @@ def create_tables(conn):
         length_m INTEGER NOT NULL
     );
 
-    -- Google requests sent per local calendar month, counted before sending, so
-    -- use_request can refuse anything past the free allowance
+    -- API requests sent per local calendar month, counted before sending, so
+    -- use_request can refuse Google requests past the monthly limit
     CREATE TABLE IF NOT EXISTS api_usage (
-        api TEXT NOT NULL,          -- 'google_routes' or 'google_places'
+        api TEXT NOT NULL,          -- 'tomtom_routing', 'tomtom_search', 'tomtom_reverse_geocode', 'google_routes', 'google_places'
         month TEXT NOT NULL,        -- e.g. 2026-10
         requests INTEGER NOT NULL,
         PRIMARY KEY (api, month)
@@ -164,24 +164,45 @@ def requests_this_month(conn, api: str) -> int:
     return row[0] if row else 0
 
 
-# Counts one request toward this month's limit and returns the new total, or None
-# once the limit is reached, in which case the caller must not send the request.
-# Counting before sending means a request that fails after reaching Google still counts
-def use_request(conn, api: str, monthly_limit: int) -> int | None:
-    used = requests_this_month(conn, api)
-    if used >= monthly_limit:
-        return None
-
-    conn.execute(
+# Counts one request this month and returns the new total. Called before sending,
+# so a request that fails after reaching the API still counts
+def record_request(conn, api: str) -> int:
+    row = conn.execute(
         """
         INSERT INTO api_usage (api, month, requests) VALUES (?, ?, 1)
         ON CONFLICT (api, month) DO UPDATE SET requests = requests + 1
+        RETURNING requests
         """,
         (api, datetime.now().strftime("%Y-%m"))
-    )
+    ).fetchone()
     conn.commit()
 
-    return used + 1
+    return row[0]
+
+
+# Like record_request, but returns None without counting once the limit is reached,
+# in which case the caller must not send the request
+def use_request(conn, api: str, monthly_limit: int) -> int | None:
+    if requests_this_month(conn, api) >= monthly_limit:
+        return None
+
+    return record_request(conn, api)
+
+
+# TomTom requests weren't counted before api_usage tracked them, so seed this month's
+# routing count from the stored samples (each one is a successful request). Only
+# inserts when the month has no count yet, so it never overwrites real counting
+def backfill_tomtom_usage(conn):
+    month = datetime.now().strftime("%Y-%m")
+
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO api_usage (api, month, requests)
+        SELECT 'tomtom_routing', ?, COUNT(*) FROM commute_samples WHERE substr(departure_date, 1, 7) = ?
+        """,
+        (month, month)
+    )
+    conn.commit()
 
 
 def add_sample(conn, origin: Location, destination: Location, route: TripRoute, allow_tolls: bool):
