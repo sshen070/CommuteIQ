@@ -6,7 +6,10 @@ import requests
 routing_url: str = "https://api.tomtom.com/routing/1/calculateRoute/"
 search_url: str = "https://api.tomtom.com/search/2/"
 
-# Seconds before giving up on a TomTom request
+google_routes_url: str = "https://routes.googleapis.com/directions/v2:computeRoutes"
+google_places_url: str = "https://places.googleapis.com/v1/places:searchText"
+
+# Seconds before giving up on a TomTom or Google request
 timeout: int = 10
 
 
@@ -64,8 +67,65 @@ def reverse_geocode(lat: float, lon: float, api_key: str) -> str | None:
     return addresses[0]["address"].get("freeformAddress") if addresses else None
 
 
-def check_response(response):
+def fetch_google_route(origin: Location, destination: Location, api_key: str, allow_tolls: bool = False,
+                       traffic_model: str = "PESSIMISTIC") -> dict:
 
-    # Report failures without the request URL, which contains the API key
+    # Google takes the key in a header, so request URLs never contain it
+    headers = {
+        "X-Goog-Api-Key": api_key,
+        "X-Goog-FieldMask": "routes.duration,routes.staticDuration,routes.distanceMeters",
+    }
+
+    # No departureTime = leaving now. trafficModel needs TRAFFIC_AWARE_OPTIMAL,
+    # which bills as Compute Routes Pro (5,000 free per month, then $10 per 1,000)
+    body = {
+        "origin": google_waypoint(origin),
+        "destination": google_waypoint(destination),
+        "travelMode": "DRIVE",
+        "routingPreference": "TRAFFIC_AWARE_OPTIMAL",
+        "trafficModel": traffic_model,
+        "routeModifiers": {"avoidTolls": not allow_tolls},
+    }
+
+    response = requests.post(google_routes_url, headers=headers, json=body, timeout=timeout)
+    check_response(response, "Google Routes")
+
+    # Route stats: duration with/without traffic (strings like "1534s"), distance
+    return response.json()["routes"][0]
+
+
+def search_google_places(query: str, api_key: str, limit: int = 5) -> list[Location]:
+
+    # Text Search finds POIs TomTom doesn't index, e.g. individual UCR parking lots.
+    # These fields bill as Text Search Pro (5,000 free per month)
+    headers = {
+        "X-Goog-Api-Key": api_key,
+        "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.location",
+    }
+    body = {"textQuery": query, "pageSize": limit, "regionCode": "us"}
+
+    response = requests.post(google_places_url, headers=headers, json=body, timeout=timeout)
+    check_response(response, "Google Places")
+
+    return [
+        Location(
+            address=place.get("formattedAddress", ""),
+            lat=place["location"]["latitude"],
+            lon=place["location"]["longitude"],
+            name=place.get("displayName", {}).get("text"),
+        )
+        for place in response.json().get("places", [])
+    ]
+
+
+def google_waypoint(place: Location) -> dict:
+    return {"location": {"latLng": {"latitude": place.lat, "longitude": place.lon}}}
+
+
+def check_response(response, service: str = "TomTom"):
+
+    # Report failures without the request URL, which contains the TomTom key.
+    # Error bodies are often pretty-printed JSON, so keep them to one log line
     if response.status_code != 200:
-        raise RuntimeError(f"TomTom request failed: HTTP {response.status_code} {response.text[:200]}")
+        body = " ".join(response.text.split())[:200]
+        raise RuntimeError(f"{service} request failed: HTTP {response.status_code} {body}")
