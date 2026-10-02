@@ -4,6 +4,15 @@ import os
 # One rule for every setting: a value in .env wins; otherwise the answer saved by
 # setup_locations.py is used. Setup only asks about what .env leaves out.
 
+# Google's free requests per calendar month, per SKU (Compute Routes Pro, Text
+# Search Pro). Requests past this are refused, so Google usage never bills
+google_monthly_limit: int = 5000
+max_weekdays_per_month: int = 23
+
+# TomTom answers 429 past its free monthly allowance, so samples would be lost until it resets
+tomtom_free_per_month: int = 20000
+max_days_per_month: int = 31
+
 
 # Stripped value, or None if unset or blank
 def env(name: str) -> str | None:

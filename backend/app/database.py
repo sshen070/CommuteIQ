@@ -1,5 +1,6 @@
 from dataclasses import replace
 from datetime import datetime
+from google_route import GoogleRoute
 from location import Location
 from pathlib import Path
 from trip_route import TripRoute
@@ -26,12 +27,12 @@ def connect() -> sqlite3.Connection:
 # Create tables if they do not already exist
 def create_tables(conn):
     conn.executescript("""
-    -- Places resolved via TomTom search; the newest row per role is the active one
+    -- Places resolved via Google or TomTom search; the newest row per role is the active one
     CREATE TABLE IF NOT EXISTS locations (
         id INTEGER PRIMARY KEY,
 
         role TEXT NOT NULL CHECK (role IN ('HOME', 'UNI')),
-        name TEXT,                  -- user's label, or TomTom's POI name
+        name TEXT,                  -- user's label, or the search result's place name
         address TEXT NOT NULL,
         lat REAL NOT NULL,
         lon REAL NOT NULL,
@@ -69,6 +70,40 @@ def create_tables(conn):
         traffic_delay_s INTEGER NOT NULL,
         length_m INTEGER NOT NULL,
         traffic_length_m INTEGER NOT NULL
+    );
+
+    -- One row per Google Routes query, only in weekday commute windows (seconds, meters).
+    -- Column names match commute_samples where the meaning does, for side-by-side queries.
+    -- Google returns no timestamps, so departure_at is when the request was sent
+    CREATE TABLE IF NOT EXISTS google_samples (
+        id INTEGER PRIMARY KEY,
+
+        origin_id INTEGER NOT NULL REFERENCES locations(id),
+        destination_id INTEGER NOT NULL REFERENCES locations(id),
+
+        -- 1 = toll roads permitted on this route, 0 = toll roads avoided
+        allow_tolls INTEGER NOT NULL CHECK (allow_tolls IN (0, 1)),
+
+        -- PESSIMISTIC = longer than actual on most days; BEST_GUESS = typical
+        traffic_model TEXT NOT NULL,
+
+        departure_at TEXT NOT NULL,
+        departure_date TEXT NOT NULL,
+        departure_weekday TEXT NOT NULL,
+        departure_time TEXT NOT NULL,
+
+        travel_time_s INTEGER NOT NULL,         -- with traffic, under traffic_model
+        no_traffic_time_s INTEGER NOT NULL,     -- Google's staticDuration
+        length_m INTEGER NOT NULL
+    );
+
+    -- Google requests sent per local calendar month, counted before sending, so
+    -- use_request can refuse anything past the free allowance
+    CREATE TABLE IF NOT EXISTS api_usage (
+        api TEXT NOT NULL,          -- 'google_routes' or 'google_places'
+        month TEXT NOT NULL,        -- e.g. 2026-10
+        requests INTEGER NOT NULL,
+        PRIMARY KEY (api, month)
     );
     """)
 
@@ -120,6 +155,35 @@ def count_samples(conn) -> int:
     return conn.execute("SELECT COUNT(*) FROM commute_samples").fetchone()[0]
 
 
+def requests_this_month(conn, api: str) -> int:
+    row = conn.execute(
+        "SELECT requests FROM api_usage WHERE api = ? AND month = ?",
+        (api, datetime.now().strftime("%Y-%m"))
+    ).fetchone()
+
+    return row[0] if row else 0
+
+
+# Counts one request toward this month's limit and returns the new total, or None
+# once the limit is reached, in which case the caller must not send the request.
+# Counting before sending means a request that fails after reaching Google still counts
+def use_request(conn, api: str, monthly_limit: int) -> int | None:
+    used = requests_this_month(conn, api)
+    if used >= monthly_limit:
+        return None
+
+    conn.execute(
+        """
+        INSERT INTO api_usage (api, month, requests) VALUES (?, ?, 1)
+        ON CONFLICT (api, month) DO UPDATE SET requests = requests + 1
+        """,
+        (api, datetime.now().strftime("%Y-%m"))
+    )
+    conn.commit()
+
+    return used + 1
+
+
 def add_sample(conn, origin: Location, destination: Location, route: TripRoute, allow_tolls: bool):
     conn.execute(
         """
@@ -154,6 +218,43 @@ def add_sample(conn, origin: Location, destination: Location, route: TripRoute, 
             route.trafficDelayInSeconds,
             route.lengthInMeters,
             route.trafficLengthInMeters
+        )
+    )
+    conn.commit()
+
+
+def add_google_sample(conn, origin: Location, destination: Location, route: GoogleRoute, allow_tolls: bool):
+    conn.execute(
+        """
+        INSERT INTO google_samples
+        (
+            origin_id,
+            destination_id,
+            allow_tolls,
+            traffic_model,
+            departure_at,
+            departure_date,
+            departure_weekday,
+            departure_time,
+            travel_time_s,
+            no_traffic_time_s,
+            length_m
+        )
+        VALUES
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            origin.id,
+            destination.id,
+            int(allow_tolls),
+            route.trafficModel,
+            route.departureTime,
+            route.departure_date,
+            route.departure_weekday,
+            route.departure_time,
+            route.travel_time_s,
+            route.no_traffic_time_s,
+            route.distanceMeters
         )
     )
     conn.commit()

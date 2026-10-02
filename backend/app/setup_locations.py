@@ -1,4 +1,4 @@
-from data_extraction import reverse_geocode, search_places
+from data_extraction import reverse_geocode, search_google_places, search_places
 from dotenv import load_dotenv
 from location import Location
 
@@ -17,13 +17,23 @@ prompts = {
 coords_pattern = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$")
 
 
-def find_candidates(query: str, api_key: str) -> list[Location]:
+def find_candidates(conn, query: str, api_key: str) -> list[Location]:
     match = coords_pattern.match(query)
 
     if match:
         lat, lon = float(match[1]), float(match[2])
         address = reverse_geocode(lat, lon, api_key) or query
         return [Location(address=address, lat=lat, lon=lon)]
+
+    # Google finds places TomTom doesn't index (e.g. individual UCR parking lots)
+    if google_key := config.env("GOOGLE_CLOUD_API_KEY"):
+        try:
+            # Counted like Google Routes; past the free allowance, search TomTom instead
+            if database.use_request(conn, "google_places", config.google_monthly_limit) is not None:
+                return search_google_places(query, google_key)
+            print("  Google's free searches for this month are used up, using TomTom.")
+        except Exception as err:
+            print(f"  Google search failed, using TomTom: {str(err).replace(google_key, '***')}")
 
     return search_places(query, api_key)
 
@@ -44,7 +54,7 @@ def pick(candidates: list[Location]) -> Location | None:
     return candidates[int(choice) - 1] if choice != "0" else None
 
 
-def choose_place(prompt: str, api_key: str, query: str | None = None) -> Location:
+def choose_place(conn, prompt: str, api_key: str, query: str | None = None) -> Location:
 
     while True:
         # A query from .env is tried first; after that, ask
@@ -53,7 +63,7 @@ def choose_place(prompt: str, api_key: str, query: str | None = None) -> Locatio
             if not query:
                 continue
 
-        candidates = find_candidates(query, api_key)
+        candidates = find_candidates(conn, query, api_key)
         query = None
 
         if not candidates:
@@ -73,10 +83,10 @@ def setup_place(conn, role: str, prompt: str, api_key: str):
     if env_query:
         # Coordinates from .env are exact, so use them as-is; an address still needs confirming
         if coords_pattern.match(env_query):
-            place = find_candidates(env_query, api_key)[0]
+            place = find_candidates(conn, env_query, api_key)[0]
         else:
             print(f"{prompt}: searching for {role}_LOCATION from .env")
-            place = choose_place(prompt, api_key, env_query)
+            place = choose_place(conn, prompt, api_key, env_query)
 
         # Re-running setup with the same .env shouldn't add duplicate rows
         same_spot = current and (current.lat, current.lon) == (place.lat, place.lon)
@@ -90,7 +100,7 @@ def setup_place(conn, role: str, prompt: str, api_key: str):
             if keep in ("", "y", "yes"):
                 return
 
-        place = choose_place(prompt, api_key)
+        place = choose_place(conn, prompt, api_key)
 
     # Label for queries and logs; addresses and 'lat,lon' picks have no POI name
     if env_name:
@@ -129,6 +139,8 @@ def main():
 
     api_key = os.getenv("TOMTOM_API_KEY")
     conn = database.connect()
+
+    print(f"Place search: {'Google' if config.env('GOOGLE_CLOUD_API_KEY') else 'TomTom (no GOOGLE_CLOUD_API_KEY in .env)'}")
 
     for role, prompt in prompts.items():
         setup_place(conn, role, prompt, api_key)
