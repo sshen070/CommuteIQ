@@ -9,6 +9,13 @@ import os
 google_monthly_limit: int = 5000
 max_weekdays_per_month: int = 23
 
+# Through GOOGLE_CREDITS_UNTIL (last day of the Google Cloud trial), Routes requests
+# past the free 5,000 are paid from the $300 trial credits, up to this many a month
+# ($100 at most). The default windows need up to 14,904 in a 23-weekday month, which
+# comes to ~$265 for a trial running Oct 2 to Dec 30
+google_credit_monthly_limit: int = 15000
+google_price_per_1000: float = 10.0     # Compute Routes Pro, past the free 5,000
+
 # TomTom answers 429 past its free monthly allowance, so samples would be lost until it resets
 tomtom_free_per_month: int = 20000
 max_days_per_month: int = 31
