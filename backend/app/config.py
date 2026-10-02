@@ -4,6 +4,10 @@ import os
 # One rule for every setting: a value in .env wins; otherwise the answer saved by
 # setup_locations.py is used. Setup only asks about what .env leaves out.
 
+# Google's free requests per calendar month, per SKU (Compute Routes Pro, Text
+# Search Pro). Requests past this are refused, so Google usage never bills
+google_monthly_limit: int = 5000
+
 
 # Stripped value, or None if unset or blank
 def env(name: str) -> str | None:

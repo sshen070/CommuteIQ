@@ -3,11 +3,11 @@ from dataclasses import dataclass
 @dataclass
 class Location:
 
-    # Resolved via TomTom search
+    # Resolved via Google or TomTom search
     address: str
     lat: float
     lon: float
-    name: str | None = None     # POI name, e.g. "UCR Lot 41"
+    name: str | None = None     # place name, e.g. "UCR Lot 41"
 
     # Set once saved to the database
     role: str | None = None     # "HOME" or "UNI"
