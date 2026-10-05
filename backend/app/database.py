@@ -84,7 +84,8 @@ def create_tables(conn):
         -- 1 = toll roads permitted on this route, 0 = toll roads avoided
         allow_tolls INTEGER NOT NULL CHECK (allow_tolls IN (0, 1)),
 
-        -- PESSIMISTIC = longer than actual on most days; BEST_GUESS = typical
+        -- BEST_GUESS = Google's typical estimate. PESSIMISTIC (longer than actual on most
+        -- days) is no longer sampled, but older rows may have it
         traffic_model TEXT NOT NULL,
 
         departure_at TEXT NOT NULL,
@@ -162,6 +163,11 @@ def requests_this_month(conn, api: str) -> int:
     ).fetchone()
 
     return row[0] if row else 0
+
+
+# Requests per month for one API, e.g. {"2026-10": 14520}
+def requests_by_month(conn, api: str) -> dict[str, int]:
+    return dict(conn.execute("SELECT month, requests FROM api_usage WHERE api = ?", (api,)).fetchall())
 
 
 # Counts one request this month and returns the new total. Called before sending,

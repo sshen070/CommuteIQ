@@ -68,7 +68,7 @@ def reverse_geocode(lat: float, lon: float, api_key: str) -> str | None:
 
 
 def fetch_google_route(origin: Location, destination: Location, api_key: str, allow_tolls: bool = False,
-                       traffic_model: str = "PESSIMISTIC") -> dict:
+                       traffic_model: str = "BEST_GUESS") -> dict:
 
     # Google takes the key in a header, so request URLs never contain it
     headers = {
