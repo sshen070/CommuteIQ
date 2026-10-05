@@ -3,3 +3,5 @@
 backend/app/__pycache__/
 data/
 CLAUDE.md
+analysis/output/
+analysis/__pycache__/
