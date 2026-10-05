@@ -5,6 +5,7 @@ from google_route import GoogleRoute
 from trip_route import TripRoute
 
 import config
+import ctypes
 import database
 import logging
 import os
@@ -14,6 +15,17 @@ import time
 
 # Minutes between samples; samples land on clock-aligned slots (:00, :05, :10, ...)
 interval_min: int = 5
+
+# Longest single sleep while NTP hasn't synced the clock yet (after a power cut), so its
+# correction is noticed. Once synced, each slot is one sleep
+max_sleep_s: int = 30
+
+# Linux adjtimex() returns TIME_ERROR (5) while no NTP daemon has synced the clock
+time_error: int = 5
+libc = ctypes.CDLL(None, use_errno=True)
+
+# Waking more than this past a slot skips it instead of sampling off the mark
+late_limit_s: int = 30
 
 # START_AT in .env: 24-hour local HH:MM
 hh_mm = r"([01]?\d|2[0-3]):([0-5]\d)"
@@ -57,6 +69,14 @@ def next_start(start_at: str) -> float:
 
     # A naive local datetime converts via the OS, so DST changes are handled
     return target.timestamp()
+
+
+# Whether NTP has synced the clock since boot. The container shares the host's kernel clock,
+# so this reads the host's state; a zeroed struct timex (modes = 0) only reads it and needs
+# no privileges. If the call fails, report unsynced so sleeps stay short
+def clock_synced() -> bool:
+    timex = ctypes.create_string_buffer(512)    # bigger than struct timex
+    return libc.adjtimex(timex) not in (time_error, -1)
 
 
 def sleep_until(target: float):
@@ -352,9 +372,17 @@ def main():
             target = next_start(start_at)
 
     logger.info(f"First sample at {datetime.fromtimestamp(target):%a %Y-%m-%d %H:%M}")
+    logger.info(f"Clock: {'synced by NTP' if clock_synced() else f'not synced by NTP yet, re-checking it every {max_sleep_s} s'}")
 
     while True:
         sleep_until(target)
+
+        # The clock stepped forward past the slot: wait for the next one
+        if (late := time.time() - target) > late_limit_s:
+            logger.warning(f"Skipped the {datetime.fromtimestamp(target):%H:%M} slot: clock jumped {late:.0f} s past it")
+            target = next_slot(time.time())
+            continue
+
         slot = datetime.fromtimestamp(target)
         in_window = legs_in_window(windowed_legs, slot)
 
