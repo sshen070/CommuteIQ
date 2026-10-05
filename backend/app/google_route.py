@@ -10,7 +10,7 @@ class GoogleRoute:
     distanceMeters: int = field(repr=False)
 
     # Request values: Google returns no timestamps, so departure is when the request was sent
-    trafficModel: str = field(repr=False)       # e.g. "PESSIMISTIC"
+    trafficModel: str = field(repr=False)       # e.g. "BEST_GUESS"
     departureTime: str = field(repr=False)      # local ISO-8601 with UTC offset
 
     # Derived values
