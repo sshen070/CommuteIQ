@@ -101,7 +101,7 @@ def create_tables(conn):
     -- API requests sent per local calendar month, counted before sending, so
     -- use_request can refuse Google requests past the monthly limit
     CREATE TABLE IF NOT EXISTS api_usage (
-        api TEXT NOT NULL,          -- 'tomtom_routing', 'tomtom_search', 'tomtom_reverse_geocode', 'google_routes', 'google_places'
+        api TEXT NOT NULL,          -- 'tomtom_routing', 'tomtom_search', 'tomtom_reverse_geocode', 'google_routes', 'google_places', 'open_meteo'
         month TEXT NOT NULL,        -- e.g. 2026-10
         requests INTEGER NOT NULL,
         PRIMARY KEY (api, month)
@@ -170,16 +170,17 @@ def requests_by_month(conn, api: str) -> dict[str, int]:
     return dict(conn.execute("SELECT month, requests FROM api_usage WHERE api = ?", (api,)).fetchall())
 
 
-# Counts one request this month and returns the new total. Called before sending,
-# so a request that fails after reaching the API still counts
-def record_request(conn, api: str) -> int:
+# Counts requests this month (one unless a request bills as several, like an Open-Meteo
+# request for many places) and returns the new total. Called before sending, so a
+# request that fails after reaching the API still counts
+def record_request(conn, api: str, count: int = 1) -> int:
     row = conn.execute(
         """
-        INSERT INTO api_usage (api, month, requests) VALUES (?, ?, 1)
-        ON CONFLICT (api, month) DO UPDATE SET requests = requests + 1
+        INSERT INTO api_usage (api, month, requests) VALUES (?, ?, ?)
+        ON CONFLICT (api, month) DO UPDATE SET requests = requests + excluded.requests
         RETURNING requests
         """,
-        (api, datetime.now().strftime("%Y-%m"))
+        (api, datetime.now().strftime("%Y-%m"), count)
     ).fetchone()
     conn.commit()
 
