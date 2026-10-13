@@ -1,3 +1,4 @@
+from conditions.weather import WeatherCollector
 from data_extraction import fetch_google_route, fetch_route
 from datetime import date, datetime, timedelta
 from dotenv import load_dotenv
@@ -358,6 +359,10 @@ def main():
     else:
         logger.info(f"Google Routes: off ({'all windows off' if google_key else 'no GOOGLE_CLOUD_API_KEY in .env'})")
 
+    # Weather at points along the route (conditions/), on slots that fall on WEATHER_EVERY_MIN
+    weather = WeatherCollector(conn, home, uni, api_key, interval_min)
+    weather.log_plan()
+
     # Optional delayed first sample, e.g. START_AT=00:00 so data begins on a clean day.
     # Only for an empty database: after a restart mid-collection, resume right away
     target = next_slot(time.time())
@@ -410,6 +415,9 @@ def main():
                             f"limit {config.google_monthly_limit:,} a month")
 
             collect_google_samples(conn, all_legs if google_all_day else in_window, google_key, queries, limit)
+
+        # After the drive times, so they keep their slot timing; logs failures, never raises
+        weather.on_slot(slot)
 
         target = next_slot(time.time())
 
