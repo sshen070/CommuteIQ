@@ -1,0 +1,6 @@
+# Analysis only: kept out of backend/requirements.txt so the collector image stays small
+pandas
+matplotlib
+
+# Read DB_PATH from .env
+python-dotenv
