@@ -1,0 +1,40 @@
+# Days that may change traffic, read by calendar_days.py. One date range per line: start and
+# end are inclusive, YYYY-MM-DD; leave end blank for a single day. Kinds:
+#   holiday     public holiday (federal or California)
+#   uni_closed  UCR campus holiday
+#   uni_finals  UCR finals week
+#   uni_break   UCR between quarters (no instruction)
+#   k12_break   local K-12 schools out. These often move traffic more than federal holidays.
+#               Use a generic name like "K-12 Thanksgiving break" so the file doesn't name
+#               the district you live in
+#   note        anything else worth tagging: a planned freeway closure, a big event, a crash
+# UCR dates: 2026-27 approved calendar, documents.ucr.edu/provost/5-year-calendar_2023-2029.pdf
+start,end,kind,name
+2026-09-07,,holiday,Labor Day
+2026-10-12,,holiday,Columbus Day / Indigenous Peoples' Day
+2026-11-11,,holiday,Veterans Day
+2026-11-26,,holiday,Thanksgiving
+2026-11-27,,holiday,Day after Thanksgiving (CA)
+2026-12-25,,holiday,Christmas
+2027-01-01,,holiday,New Year's Day
+2027-01-18,,holiday,Martin Luther King Jr. Day
+2027-02-15,,holiday,Presidents' Day
+2027-03-31,,holiday,Cesar Chavez Day (CA)
+2027-05-31,,holiday,Memorial Day
+2027-06-18,,holiday,Juneteenth (observed)
+2027-07-05,,holiday,Independence Day (observed)
+2026-11-11,,uni_closed,Veterans Day
+2026-11-26,2026-11-27,uni_closed,Thanksgiving
+2026-12-24,2026-12-25,uni_closed,Christmas
+2026-12-31,2027-01-01,uni_closed,New Year
+2027-01-18,,uni_closed,Martin Luther King Jr. Day
+2027-02-15,,uni_closed,Presidents' Day
+2027-03-26,,uni_closed,Cesar Chavez Day
+2027-05-31,,uni_closed,Memorial Day
+2027-06-18,,uni_closed,Juneteenth
+2026-12-05,2026-12-11,uni_finals,Fall finals
+2027-03-13,2027-03-19,uni_finals,Winter finals
+2027-06-05,2027-06-11,uni_finals,Spring finals
+2026-12-12,2027-01-03,uni_break,Winter break
+2027-03-20,2027-03-28,uni_break,Spring break
+2027-06-12,2027-09-22,uni_break,Summer
