@@ -12,10 +12,13 @@ matplotlib.use("Agg")   # headless: the server has no display
 import matplotlib.pyplot as plt
 
 # One chart per direction: drive time by local departure time, toll-free and
-# toll routes together. Writes output/home_to_uni.png and output/uni_to_home.png.
+# toll routes together. Google's best guess (primary) is a solid median with its p10–p90
+# band; TomTom is a dashed median with its samples, in the same route color.
+# Writes output/home_to_uni.png and output/uni_to_home.png.
 
 # Fixed per toll option, so a chart with only one option keeps the same color
 series_colors = {0: "#2a78d6", 1: "#eb6834"}
+tomtom_dashes = (0, (4, 2.5))
 
 surface = "#fcfcfb"
 ink = "#0b0b0b"
@@ -34,27 +37,41 @@ def plot_leg(df: pd.DataFrame, stats: pd.DataFrame, origin: str, destination: st
     fig.patch.set_facecolor(surface)
     ax.set_facecolor(surface)
 
-    toll_options = sorted(leg["allow_tolls"].unique())
+    tomtom = leg[leg["source"] == "TomTom"]
+    toll_options = sorted(tomtom["allow_tolls"].unique())
+    google_options = sorted(leg[leg["source"] == "Google"]["allow_tolls"].unique())
     peaks = []
 
+    # Reindex to every slot so collector downtime shows as a gap, not a straight line
+    def slot_series(source: str, tolls: int) -> pd.DataFrame:
+        return stats[
+            (stats["source"] == source) & (stats["origin"] == origin) & (stats["destination"] == destination)
+            & (stats["allow_tolls"] == tolls)
+        ].set_index("slot").reindex(range(0, 24 * 60, samples.slot_min))
+
+    x = (pd.RangeIndex(0, 24 * 60, samples.slot_min) + samples.slot_min / 2) / 60
+
+    # TomTom: every sample, faintly, so day-to-day spread stays visible, and a dashed median
     for tolls in toll_options:
         color = series_colors[tolls]
-        raw = leg[leg["allow_tolls"] == tolls]
-
-        # Every sample, faintly, so day-to-day spread stays visible
+        raw = tomtom[tomtom["allow_tolls"] == tolls]
         ax.scatter(raw["dep_min"] / 60, raw["travel_min"], s=6, color=color, alpha=0.3, linewidths=0, zorder=2)
+        ax.plot(x, slot_series("TomTom", tolls)["median"], color=color, linewidth=1.6, linestyle=tomtom_dashes,
+                dash_capstyle="round", zorder=3)
 
-        # Reindex to every slot so collector downtime shows as a gap, not a straight line
-        series = stats[
-            (stats["origin"] == origin) & (stats["destination"] == destination) & (stats["allow_tolls"] == tolls)
-        ].set_index("slot").reindex(range(0, 24 * 60, samples.slot_min))
-        x = (series.index + samples.slot_min / 2) / 60
-
+    # Google (primary): band and solid median
+    for tolls in google_options:
+        color = series_colors[tolls]
+        series = slot_series("Google", tolls)
         ax.fill_between(x, series["p10"], series["p90"], color=color, alpha=0.12, linewidth=0, zorder=1)
         ax.plot(x, series["median"], color=color, linewidth=2, solid_joinstyle="round", solid_capstyle="round", zorder=3)
 
+    # Each route's peak, on Google's line where it was sampled, else TomTom's
+    for tolls in sorted(set(toll_options) | set(google_options)):
+        series = slot_series("Google" if tolls in google_options else "TomTom", tolls)
         peak_slot = series["median"].idxmax()
-        peaks.append(((peak_slot + samples.slot_min / 2) / 60, series.at[peak_slot, "median"], peak_slot, color))
+        peaks.append(((peak_slot + samples.slot_min / 2) / 60, series.at[peak_slot, "median"], peak_slot,
+                      series_colors[tolls]))
 
     top = leg["travel_min"].max() * 1.12
     ax.set_ylim(0, top)
@@ -86,25 +103,43 @@ def plot_leg(df: pd.DataFrame, stats: pd.DataFrame, origin: str, destination: st
     ax.set_xlabel("Departure time (local)", color=ink_secondary, fontsize=10)
     ax.set_ylabel("Drive time (min)", color=ink_secondary, fontsize=10)
 
-    handles = [
-        Line2D([], [], color=series_colors[tolls], linewidth=2, label=f"{samples.toll_names[tolls]} · median")
-        for tolls in toll_options
+    # Legend above the plot, where peaks and labels can never land on it: Google in the
+    # first row, TomTom in a second under the matching route. Blanks hold the grid in place
+    def blank() -> Line2D:
+        return Line2D([], [], linestyle="", label="")
+
+    routes = sorted(set(toll_options) | set(google_options))
+    google_row = [
+        Line2D([], [], color=series_colors[tolls], linewidth=2, label=f"{samples.toll_names[tolls]} · Google median")
+        if tolls in google_options else blank()
+        for tolls in routes
     ]
-    handles += [
-        Patch(color=ink_muted, alpha=0.25, linewidth=0, label="Middle 80% of samples (p10–p90)"),
-        Line2D([], [], linestyle="", marker="o", markersize=4, color=ink_muted, alpha=0.6, label="One sample"),
+    google_row.append(Patch(color=ink_muted, alpha=0.25, linewidth=0, label="Middle 80% of Google samples (p10–p90)"))
+    tomtom_row = [
+        Line2D([], [], color=series_colors[tolls], linewidth=1.6, linestyle=tomtom_dashes,
+               label=f"{samples.toll_names[tolls]} · TomTom median")
+        if tolls in toll_options else blank()
+        for tolls in routes
     ]
-    # Legend in a row above the plot, where peaks and labels can never land on it
-    ax.legend(handles=handles, loc="lower left", bbox_to_anchor=(0, 1.01), ncol=len(handles), borderaxespad=0,
+    tomtom_row.append(
+        Line2D([], [], linestyle="", marker="o", markersize=4, color=ink_muted, alpha=0.6, label="One TomTom sample")
+    )
+    if google_options:
+        # Legends fill column by column, so interleave the two rows
+        handles = [handle for column in zip(google_row, tomtom_row) for handle in column]
+    else:
+        handles = tomtom_row
+    ax.legend(handles=handles, loc="lower left", bbox_to_anchor=(0, 1.01), ncol=len(tomtom_row), borderaxespad=0,
               frameon=False, fontsize=9, labelcolor=ink_secondary, handlelength=1.8, columnspacing=1.8)
+    legend_lift = 0.045 if google_options else 0
 
     # Title and subtitle, left-aligned above the legend
     subtitle = f"{samples.days_label(days)} · {samples.coverage_label(leg)} · 15-minute departure slots"
     if (days_per_slot := leg.groupby("slot")["departure_date"].nunique().max()) < samples.trust_days:
         subtitle += f"\nEarly data ({days_per_slot} day{'s' if days_per_slot != 1 else ''} per slot): lines and bands will shift as more days are collected"
     subtitle_lines = subtitle.count("\n") + 1
-    ax.text(0, 1.08, subtitle, transform=ax.transAxes, fontsize=10, color=ink_secondary, va="bottom", linespacing=1.4)
-    ax.text(0, 1.095 + 0.042 * subtitle_lines, f"{samples.leg_name(origin, destination)}: drive time by departure time",
+    ax.text(0, 1.08 + legend_lift, subtitle, transform=ax.transAxes, fontsize=10, color=ink_secondary, va="bottom", linespacing=1.4)
+    ax.text(0, 1.095 + 0.042 * subtitle_lines + legend_lift, f"{samples.leg_name(origin, destination)}: drive time by departure time",
             transform=ax.transAxes, fontsize=15, fontweight="bold", color=ink, va="bottom")
 
     samples.output_dir.mkdir(exist_ok=True)
@@ -119,7 +154,7 @@ def main():
     samples.add_days_argument(parser)
     args = parser.parse_args()
 
-    df = samples.load(args.days)
+    df = samples.load(args.days, google=True)
     stats = samples.slot_stats(df)
 
     for origin, destination in samples.legs:
