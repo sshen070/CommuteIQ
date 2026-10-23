@@ -98,6 +98,24 @@ def create_tables(conn):
         length_m INTEGER NOT NULL
     );
 
+    -- How much of each route is freeway (route_profile.py), per direction and toll option:
+    -- TomTom's route at a quiet hour, when its historic speeds are open-road speeds. Made
+    -- once per home/uni pair; analysis uses it for driving styles (meters, seconds)
+    CREATE TABLE IF NOT EXISTS route_profiles (
+        origin_id INTEGER NOT NULL REFERENCES locations(id),
+        destination_id INTEGER NOT NULL REFERENCES locations(id),
+        allow_tolls INTEGER NOT NULL CHECK (allow_tolls IN (0, 1)),
+
+        length_m INTEGER NOT NULL,
+        freeway_m INTEGER NOT NULL,             -- in TomTom's motorway sections
+        travel_time_s INTEGER NOT NULL,
+        freeway_time_s INTEGER NOT NULL,
+
+        departure_at TEXT NOT NULL,             -- the quiet hour the route was measured for
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (origin_id, destination_id, allow_tolls)
+    );
+
     -- API requests sent per local calendar month, counted before sending, so
     -- use_request can refuse Google requests past the monthly limit
     CREATE TABLE IF NOT EXISTS api_usage (
@@ -148,6 +166,29 @@ def set_setting(conn, key: str, value: str):
     conn.execute(
         "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
         (key, value)
+    )
+    conn.commit()
+
+
+def has_route_profile(conn, origin: Location, destination: Location, allow_tolls: bool) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM route_profiles WHERE origin_id = ? AND destination_id = ? AND allow_tolls = ?",
+        (origin.id, destination.id, int(allow_tolls))
+    ).fetchone()
+    return row is not None
+
+
+def add_route_profile(conn, origin: Location, destination: Location, allow_tolls: bool, length_m: int,
+                      freeway_m: int, travel_time_s: int, freeway_time_s: int, departure_at: str):
+    created_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    conn.execute(
+        """
+        INSERT INTO route_profiles
+        (origin_id, destination_id, allow_tolls, length_m, freeway_m, travel_time_s, freeway_time_s, departure_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (origin.id, destination.id, int(allow_tolls), length_m, freeway_m, travel_time_s, freeway_time_s,
+         departure_at, created_at)
     )
     conn.commit()
 

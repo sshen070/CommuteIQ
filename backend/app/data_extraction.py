@@ -38,6 +38,31 @@ def fetch_route(origin: Location, destination: Location, api_key: str, allow_tol
     return response.json()["routes"][0]["summary"]
 
 
+# The route leaving at depart_at (ISO-8601 with offset), with its line, motorway sections and
+# turn-by-turn instructions (cumulative time to each). Live traffic is off, but TomTom still
+# applies its historic speeds for that time, so a quiet hour gives open-road speeds
+def fetch_route_sections(origin: Location, destination: Location, api_key: str, allow_tolls: bool,
+                         depart_at: str) -> dict:
+    coords = f"{origin.lat},{origin.lon}:{destination.lat},{destination.lon}"
+    params = {
+        "key": api_key,
+        "traffic": "false",
+        "travelMode": "car",
+        "routeType": "fastest",
+        "departAt": depart_at,
+        "sectionType": "motorway",
+        "instructionsType": "coded",
+    }
+
+    if not allow_tolls:
+        params["avoid"] = "tollRoads"
+
+    response = requests.get(f"{routing_url}{coords}/json", params=params, timeout=timeout)
+    check_response(response)
+
+    return response.json()["routes"][0]
+
+
 def search_places(query: str, api_key: str, limit: int = 5) -> list[Location]:
 
     # Fuzzy search matches addresses and POIs (e.g. parking lots), best match first
