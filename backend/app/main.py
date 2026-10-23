@@ -11,6 +11,7 @@ import database
 import logging
 import os
 import re
+import route_profile
 import sys
 import time
 
@@ -363,6 +364,9 @@ def main():
     weather = WeatherCollector(conn, home, uni, api_key, interval_min)
     weather.log_plan()
 
+    # Freeway km and open-road time per route, for analysis; 4 requests once per home/uni pair
+    profiled = route_profile.load_or_make(conn, home, uni, api_key)
+
     # Optional delayed first sample, e.g. START_AT=00:00 so data begins on a clean day.
     # Only for an empty database: after a restart mid-collection, resume right away
     target = next_slot(time.time())
@@ -418,6 +422,11 @@ def main():
 
         # After the drive times, so they keep their slot timing; logs failures, never raises
         weather.on_slot(slot)
+
+        # A route profile request failed earlier: try again once an hour, so an error that
+        # doesn't clear can't eat into TomTom's daily allowance
+        if not profiled and slot.minute == 0:
+            profiled = route_profile.load_or_make(conn, home, uni, api_key)
 
         target = next_slot(time.time())
 
