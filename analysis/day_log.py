@@ -68,9 +68,11 @@ def add_diff(df: pd.DataFrame) -> pd.DataFrame:
 # difference from the other days (+ slower, - faster), and its root mean square (RMSE),
 # the typical size of the difference either way. A day that's 5 minutes slow all day and
 # one that swings 5 minutes either side share an RMSE, but not an average difference.
-# base_days is how many other days the day was typically compared with
+# base_days is how many other days the day was typically compared with. Also, from the
+# same drives (with or without a baseline), the drives that met rain and the wind on them
 def leg_summary(df: pd.DataFrame) -> pd.DataFrame:
-    compared = df[(df["allow_tolls"] == 0) & df["in_window"] & df["diff_min"].notna()]
+    driven = df[(df["allow_tolls"] == 0) & df["in_window"]]
+    compared = driven[driven["diff_min"].notna()]
     out = pd.DataFrame(index=pd.Index(sorted(df["departure_date"].unique()), name="date"))
     out["base_days"] = compared.groupby("departure_date")["base_days"].median()
 
@@ -82,6 +84,13 @@ def leg_summary(df: pd.DataFrame) -> pd.DataFrame:
         out[f"{prefix}_diff_min"] = by_day.mean()
         out[f"{prefix}_rmse_min"] = (leg["diff_min"] ** 2).groupby(leg["departure_date"]).mean() ** 0.5
         out[f"{prefix}_compared"] = by_day.size()
+
+        rainy = driven[
+            (driven["origin"] == origin) & (driven["destination"] == destination) & driven["rain_headwind_kmh"].notna()
+        ].groupby("departure_date")
+        out[f"{prefix}_rain_drives"] = rainy.size().reindex(out.index, fill_value=0)
+        out[f"{prefix}_rain_headwind_kmh"] = rainy["rain_headwind_kmh"].mean()
+        out[f"{prefix}_rain_cross_gust_kmh"] = rainy["rain_cross_gust_kmh"].max()
 
     return out
 
@@ -136,6 +145,33 @@ def runs(glare: dict[int, float]) -> str:
         f"{samples.hhmm(a)}–{samples.hhmm(b + 5)} ({max(km for m, km in glare.items() if a <= m <= b):.0f} km)"
         for a, b in spans
     )
+
+
+# Per day with rain on commute drives: for each direction, the wind against the car where
+# it was raining. Shows whether one direction tends to drive into the rain
+def print_rain_wind(days: pd.DataFrame):
+    print("\nRain and wind on toll-free drives inside the commute windows, counted only where rain was falling."
+          "\nHeadwind: per drive, the average along its rainy stretches (+ into the wind, - tailwind); then"
+          " averaged over the day's drives in rain.")
+
+    prefixes = [(f"{origin.lower()}_to_{destination.lower()}", samples.leg_name(origin, destination))
+                for origin, destination in samples.legs]
+    rainy = days[(days[[f"{prefix}_rain_drives" for prefix, _ in prefixes]] > 0).any(axis=1)]
+    if rainy.empty:
+        print("  No rain on commute drives yet.")
+        return
+
+    rows = []
+    for day, row in rainy.iterrows():
+        when = date.fromisoformat(day)
+        for i, (prefix, name) in enumerate(prefixes):
+            rows.append([
+                f"{when:%a %b} {when.day}" if i == 0 else "",
+                name, f"{int(row[f'{prefix}_rain_drives'])}",
+                number(miles(row[f"{prefix}_rain_headwind_kmh"]), "+.0f"),
+                number(miles(row[f"{prefix}_rain_cross_gust_kmh"]), ".0f"),
+            ])
+    print_table(["Date", "Direction", "Drives in rain", "Headwind mph", "Crosswind gust mph"], rows)
 
 
 # Glare departure times on the latest day, and on the first weekday after the clocks next
@@ -218,6 +254,7 @@ def main():
         rows.append(cells)
 
     print_table(header, rows)
+    print_rain_wind(days)
     print_glare(df, features.stretches(points), date.fromisoformat(days.index[-1]))
 
     # Files for later modeling
@@ -233,7 +270,8 @@ def main():
     columns = [
         "departure_date", "departure_weekday", "departure_time", "direction", "route",
         "travel_min", "day_group", "base_days", "avg_min", "diff_min", "in_window",
-        "precip_mm", "wet_share", "wet_road_mm", "weather_code", "visibility_km", "gust_kmh", "temp_c",
+        "precip_mm", "wet_share", "wet_road_mm", "weather_code", "visibility_km", "gust_kmh",
+        "rain_headwind_kmh", "rain_cross_gust_kmh", "temp_c",
         "cloud_cover_pct", "dry_days", "sun_elev", "glare_km", "dark_km",
         "holiday", "days_to_holiday", "uni", "k12_break", "notes", "dst_days",
     ]

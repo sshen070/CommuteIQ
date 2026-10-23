@@ -38,7 +38,9 @@ day_hours: tuple[int, int] = (5, 21)
 glare_max_elev: float = 25
 glare_max_offset: float = 30
 
-weather_columns = ["precip_mm", "weather_code", "visibility_m", "temp_c", "cloud_cover_pct", "wind_kmh", "gust_kmh"]
+weather_columns = [
+    "precip_mm", "weather_code", "visibility_m", "temp_c", "cloud_cover_pct", "wind_kmh", "gust_kmh", "wind_dir_deg",
+]
 
 no_weather = "No weather in the database yet. Run python -m conditions.backfill_weather (see CLAUDE.md)."
 
@@ -158,7 +160,11 @@ def stops(df: pd.DataFrame, line: pd.DataFrame) -> pd.DataFrame:
 
 
 # Weather the drive went through: each point's 15-minute block when the car passed it.
-# Worst along the way for rain, visibility and gusts; average for temperature and cloud
+# Worst along the way for rain, visibility and gusts; average for temperature and cloud.
+# Wind against the car, only on stretches where rain was falling (NaN on a dry drive):
+# rain_headwind_kmh is the km-weighted mean headwind (+ into the wind, - tailwind; the wind
+# direction is where it blows from, so a wind from the heading is a headwind), and
+# rain_cross_gust_kmh the strongest gust across the road
 def trip_weather(trips: pd.DataFrame, weather: pd.DataFrame) -> pd.DataFrame:
     # Rain at each point over the last few hours. The rolling result comes back ordered by
     # point and time, the same order as the sorted frame
@@ -172,6 +178,13 @@ def trip_weather(trips: pd.DataFrame, weather: pd.DataFrame) -> pd.DataFrame:
     )
     passed["wet"] = np.where(passed["precip_mm"].isna(), np.nan, passed["precip_mm"] >= wet_block_mm)
 
+    raining = passed["precip_mm"] >= wet_block_mm
+    offset = np.radians(passed["wind_dir_deg"] - passed["heading"])
+    headwind = passed["wind_kmh"] * np.cos(offset)
+    passed["rain_km"] = passed["stretch_km"].where(raining, 0)
+    passed["rain_headwind_x_km"] = (headwind * passed["stretch_km"]).where(raining, 0)
+    passed["rain_cross_gust_kmh"] = (passed["gust_kmh"] * np.abs(np.sin(offset))).where(raining)
+
     out = passed.groupby("sample").agg(
         precip_mm=("precip_mm", "max"),
         wet_share=("wet", "mean"),
@@ -181,9 +194,13 @@ def trip_weather(trips: pd.DataFrame, weather: pd.DataFrame) -> pd.DataFrame:
         gust_kmh=("gust_kmh", "max"),
         temp_c=("temp_c", "mean"),
         cloud_cover_pct=("cloud_cover_pct", "mean"),
+        rain_km=("rain_km", "sum"),
+        rain_headwind_x_km=("rain_headwind_x_km", "sum"),
+        rain_cross_gust_kmh=("rain_cross_gust_kmh", "max"),
     )
     out["visibility_km"] /= 1000
-    return out
+    out["rain_headwind_kmh"] = (out["rain_headwind_x_km"] / out["rain_km"]).where(out["rain_km"] > 0)
+    return out.drop(columns=["rain_km", "rain_headwind_x_km"])
 
 
 # Sun elevation and azimuth in degrees (azimuth clockwise from north) for UTC times, from
