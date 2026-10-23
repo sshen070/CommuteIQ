@@ -99,26 +99,32 @@ def groups_in(days: list[str]) -> list[str]:
     return [days_label(group) for group in day_groups if set(group) & set(days)]
 
 
-# Samples between the active home and uni (newest location per role) on the given weekdays
-def load(days: list[str]) -> pd.DataFrame:
+# The database, read-only. Close it as soon as the rows are in memory: an open
+# transaction would make the collector's inserts fail with "database is locked"
+def connect() -> sqlite3.Connection:
     load_dotenv(repo_root / ".env")
     path = Path((os.getenv("DB_PATH") or "").strip() or default_db_path).resolve()
 
     if not path.exists():
         sys.exit(f"No database at {path}. Start the collector first (see CLAUDE.md).")
+    return sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
 
-    # Read-only, and closed as soon as the rows are in memory: an open transaction
-    # would make the collector's inserts fail with "database is locked"
-    with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as conn:
+
+# Samples between the active home and uni (newest location per role) on the given weekdays.
+# source is "TomTom", plus "Google" (best guess) rows when google is set
+def load(days: list[str], google: bool = False) -> pd.DataFrame:
+    with closing(connect()) as conn:
         active = dict(conn.execute("SELECT role, MAX(id) FROM locations GROUP BY role").fetchall())
-        df = pd.read_sql_query(
-            """
-            SELECT origin_id, destination_id, allow_tolls,
-                   departure_date, departure_weekday, departure_time, travel_time_s
-            FROM commute_samples
-            """,
-            conn,
-        )
+        columns = "origin_id, destination_id, allow_tolls, departure_date, departure_weekday, departure_time, travel_time_s"
+        df = pd.read_sql_query(f"SELECT {columns}, 'TomTom' AS source FROM commute_samples", conn)
+
+        # BEST_GUESS only: it's Google's typical drive, comparable with TomTom. Old
+        # PESSIMISTIC rows are a bad-day bound and would pull the curve up
+        if google:
+            google_df = pd.read_sql_query(
+                f"SELECT {columns}, 'Google' AS source FROM google_samples WHERE traffic_model = 'BEST_GUESS'", conn
+            )
+            df = pd.concat([df, google_df], ignore_index=True)
 
     if "HOME" not in active or "UNI" not in active:
         sys.exit("Home/university locations are not set. Run setup_locations.py first.")
@@ -154,10 +160,32 @@ def load(days: list[str]) -> pd.DataFrame:
     return selected.drop(columns=["origin_id", "destination_id"])
 
 
-# Median and spread of travel time per (leg, toll option, 15-minute slot)
+# Per route of the active home/uni (route_profiles, measured by the collector): length_km,
+# freeway_km, and freeway_share, the freeway's share of the open-road drive time. Empty
+# until the collector has made them
+def load_profiles() -> pd.DataFrame:
+    with closing(connect()) as conn:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'route_profiles'").fetchone():
+            return pd.DataFrame(columns=["origin", "destination", "allow_tolls", "length_km", "freeway_km", "freeway_share"])
+        active = dict(conn.execute("SELECT role, MAX(id) FROM locations GROUP BY role").fetchall())
+        df = pd.read_sql_query("SELECT * FROM route_profiles", conn)
+
+    role_of = {active.get("HOME"): "HOME", active.get("UNI"): "UNI"}
+    df = df[df["origin_id"].isin(role_of) & df["destination_id"].isin(role_of)]
+    return pd.DataFrame({
+        "origin": df["origin_id"].map(role_of),
+        "destination": df["destination_id"].map(role_of),
+        "allow_tolls": df["allow_tolls"],
+        "length_km": df["length_m"] / 1000,
+        "freeway_km": df["freeway_m"] / 1000,
+        "freeway_share": df["freeway_time_s"] / df["travel_time_s"],
+    }).reset_index(drop=True)
+
+
+# Median and spread of travel time per (source, leg, toll option, 15-minute slot)
 def slot_stats(df: pd.DataFrame) -> pd.DataFrame:
     return (
-        df.groupby(["origin", "destination", "allow_tolls", "slot"])
+        df.groupby(["source", "origin", "destination", "allow_tolls", "slot"])
         .agg(
             days=("departure_date", "nunique"),
             samples=("travel_min", "size"),
