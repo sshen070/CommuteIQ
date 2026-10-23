@@ -297,7 +297,7 @@ def build(df: pd.DataFrame, points: pd.DataFrame, weather: pd.DataFrame) -> tupl
 
 
 # Local departures (minutes after midnight) on a date that would drive into a low sun, with
-# the km of glare. typical_min maps each 15-minute slot to its usual drive time, which sets
+# the km of glare. typical_min maps each departure slot to its usual drive time, which sets
 # when each stretch is reached
 def glare_departures(day: date, origin: str, line: pd.DataFrame, typical_min: pd.Series) -> dict[int, float]:
     departures = pd.date_range(f"{day} 00:00", f"{day} 23:55", freq="5min", tz=local_tz)

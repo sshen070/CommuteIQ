@@ -134,7 +134,7 @@ def plot_leg(df: pd.DataFrame, stats: pd.DataFrame, origin: str, destination: st
     legend_lift = 0.045 if google_options else 0
 
     # Title and subtitle, left-aligned above the legend
-    subtitle = f"{samples.days_label(days)} · {samples.coverage_label(leg)} · 15-minute departure slots"
+    subtitle = f"{samples.days_label(days)} · {samples.coverage_label(leg)} · {samples.slot_min}-minute departure slots"
     if (days_per_slot := leg.groupby("slot")["departure_date"].nunique().max()) < samples.trust_days:
         subtitle += f"\nEarly data ({days_per_slot} day{'s' if days_per_slot != 1 else ''} per slot): lines and bands will shift as more days are collected"
     subtitle_lines = subtitle.count("\n") + 1

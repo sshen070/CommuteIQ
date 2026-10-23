@@ -13,11 +13,15 @@ import sys
 # How far before class to look for a departure slot
 lookback_min: int = 4 * 60
 
-# How long you'd stay at uni to dodge traffic, and the least drive time worth waiting for.
-# When waiting is worth it, leave at the first slot within near_best_min of the best one.
+# How long you'd stay at uni to dodge traffic, and the least drive time worth waiting for,
+# before class (leaving home earlier) or after it. When waiting is worth it, the departure
+# is the one closest to the no-wait slot whose median is within near_best_min of the best
+# in the window and still saves worth_waiting_min. A slot's median is uncertain by about
+# 1-2 min with a few weeks of days, so near_best_min stays well above that; each extra
+# minute of it trades about 6 min less waiting for 1 min more driving
 max_wait_min: int = 3 * 60
 worth_waiting_min: int = 10
-near_best_min: int = 3
+near_best_min: int = 5
 
 # A slot is "slow" when its median is this much above the quickest slot's
 slow_factor: float = 1.25
@@ -82,8 +86,19 @@ def leave_by(series: pd.DataFrame, class_start: int, buffer: int) -> pd.Series |
     return window.iloc[first_late - 1]
 
 
-# Leave right after class, or wait for the first slot (within max_wait_min) that is
-# near the best drive time, if that cuts at least worth_waiting_min of driving
+# Leave home earlier than the latest safe slot: the latest slot in the lookback window
+# whose median is within near_best_min of the window's best and at least worth_waiting_min
+# shorter, so the least time is spent waiting at uni. Every slot before the latest safe
+# one also arrives on time (see leave_by)
+def leave_earlier(series: pd.DataFrame, latest: pd.Series, class_start: int) -> pd.Series | None:
+    window = series[(series.index >= class_start - lookback_min) & (series.index < latest.name)]
+    worth_it = window[(window["median"] <= window["median"].min() + near_best_min)
+                      & (window["median"] <= latest["median"] - worth_waiting_min)]
+    return worth_it.iloc[-1] if not worth_it.empty else None
+
+
+# Leave right after class, or wait for the first slot (within max_wait_min) whose median
+# is within near_best_min of the best and at least worth_waiting_min shorter
 def heading_home(series: pd.DataFrame, class_end: int) -> tuple[pd.Series, pd.Series] | None:
     # "Leave then" must be the class-end slot itself, not the next slot that has data
     first_slot = class_end // samples.slot_min * samples.slot_min
@@ -93,11 +108,11 @@ def heading_home(series: pd.DataFrame, class_end: int) -> tuple[pd.Series, pd.Se
     window = series[(series.index >= first_slot) & (series.index <= class_end + max_wait_min)]
 
     right_away = window.iloc[0]
-    best = window[window["median"] <= window["median"].min() + near_best_min].iloc[0]
+    worth_it = window[(window["median"] <= window["median"].min() + near_best_min)
+                      & (window["median"] <= right_away["median"] - worth_waiting_min)]
 
     # Not worth staying unless it saves real time
-    if right_away["median"] - best["median"] < worth_waiting_min:
-        best = right_away
+    best = worth_it.iloc[0] if not worth_it.empty else right_away
     return right_away, best
 
 
@@ -194,16 +209,22 @@ def main():
     for tolls in sorted(styled[styled["origin"] == "HOME"]["allow_tolls"].unique()):
         print(f"\nLeave home by, {samples.toll_names[tolls].lower()}: latest departure that still arrives"
               f" {args.buffer} min before class on a bad day (p90).")
-        print("Each cell: leave-by time · p90 / median drive time.")
+        print(f"Each cell: leave-by time · p90 / median drive time; \"or\" = leave earlier to save {worth_waiting_min}+ min"
+              f" of driving: the latest departure within {near_best_min} min of the best drive in the {lookback_min // 60} h"
+              f" before class.")
         rows = []
         for class_start in sorted(args.class_start):
             row = [samples.hhmm(class_start)]
             for name in style_names:
-                result = leave_by(series_for(stats, "HOME", "UNI", tolls, name), class_start, args.buffer)
+                series = series_for(stats, "HOME", "UNI", tolls, name)
+                result = leave_by(series, class_start, args.buffer)
                 if isinstance(result, str):
                     row.append(result)
-                else:
-                    row.append(f"{samples.hhmm(result.name)} · {result['p90']:.0f} / {result['median']:.0f} min{mark(result)}")
+                    continue
+                cell = f"{samples.hhmm(result.name)} · {result['p90']:.0f} / {result['median']:.0f} min{mark(result)}"
+                if (earlier := leave_earlier(series, result, class_start)) is not None:
+                    cell += f", or {samples.hhmm(earlier.name)} · {earlier['median']:.0f} min{mark(earlier)}"
+                row.append(cell)
             rows.append(row)
         print_table(["Class", *style_names], rows)
 
@@ -212,7 +233,8 @@ def main():
         print(f"\nHeading home, {samples.toll_names[tolls].lower()}: leave right after class, or wait up to"
               f" {max_wait_min // 60} h at uni for traffic to ease?")
         print(f"Each cell: when to leave · median drive · typical arrival home. Waiting is suggested only"
-              f" when it saves {worth_waiting_min}+ min of driving.")
+              f" when it saves {worth_waiting_min}+ min of driving: the first departure within {near_best_min} min of"
+              f" the best drive in the next {max_wait_min // 60} h.")
         rows = []
         for class_end in sorted(args.class_end):
             row = [samples.hhmm(class_end)]

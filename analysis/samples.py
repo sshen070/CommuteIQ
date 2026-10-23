@@ -18,7 +18,7 @@ output_dir: Path = Path(__file__).resolve().parent / "output"
 # CommuteIQ/data/commute.db unless DB_PATH is set (same rule as backend/app/database.py)
 default_db_path: Path = repo_root / "data" / "commute.db"
 
-# Departures are bucketed into 15-minute slots of local clock time
+# Departures are bucketed into 5-minute slots of local clock time, the collector's own step
 slot_min: int = 5
 
 # Below this many days per slot, p90 is roughly the worst day seen, not a real percentile
@@ -182,7 +182,7 @@ def load_profiles() -> pd.DataFrame:
     }).reset_index(drop=True)
 
 
-# Median and spread of travel time per (source, leg, toll option, 15-minute slot)
+# Median and spread of travel time per (source, leg, toll option, departure slot)
 def slot_stats(df: pd.DataFrame) -> pd.DataFrame:
     return (
         df.groupby(["source", "origin", "destination", "allow_tolls", "slot"])
