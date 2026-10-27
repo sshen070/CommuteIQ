@@ -41,6 +41,14 @@ daily_limit: int = 10_000
 # the data's own 15-minute step
 default_every_min: int = 15
 
+# Minutes between forecast refreshes unless FORECAST_EVERY_MIN says otherwise. The US model
+# (HRRR) runs every hour, so an hourly refresh picks up each new run
+default_forecast_every_min: int = 60
+
+# Days of forecast per refresh. Times come back in GMT, where a local evening falls on the
+# next day, so 3 GMT days are needed to reach tomorrow's evening commute
+forecast_days: int = 3
+
 # Readings are taken this many minutes after the quarter hour. On the hour and half hour,
 # Open-Meteo often answers 503 "overloaded" (7 of 62 readings on Oct 12, 2026), when
 # scheduled jobs everywhere call it. Current conditions are the latest 15-minute block,
@@ -50,15 +58,15 @@ reading_offset_min: int = 5
 logger = logging.getLogger("commuteiq")
 
 
-# WEATHER_EVERY_MIN from .env: a multiple of the collector's slot that divides an hour,
-# so readings land on the same clock times every hour, or None for "off"
-def every_min(interval_min: int) -> int | None:
-    value = config.env("WEATHER_EVERY_MIN") or str(default_every_min)
+# WEATHER_EVERY_MIN (or FORECAST_EVERY_MIN) from .env: a multiple of the collector's slot
+# that divides an hour, so readings land on the same clock times every hour, or None for "off"
+def every_min(interval_min: int, name: str = "WEATHER_EVERY_MIN", default: int = default_every_min) -> int | None:
+    value = config.env(name) or str(default)
     if value.lower() == "off":
         return None
 
     if not value.isdigit() or int(value) == 0 or int(value) % interval_min or 60 % int(value):
-        sys.exit(f"WEATHER_EVERY_MIN must be 5, 10, 15, 20, 30 or 60 minutes, or off (got {value!r})")
+        sys.exit(f"{name} must be 5, 10, 15, 20, 30 or 60 minutes, or off (got {value!r})")
 
     return int(value)
 
@@ -121,41 +129,98 @@ def fetch_archive(points: list[WeatherPoint], start: date, end: date) -> list[tu
     return rows
 
 
+# The forecast at every point per 15-minute block, from the start of today (GMT) through
+# forecast_days, each block with the chance of rain in its hour. Open-Meteo labels an hourly
+# chance by the hour's end, and a block by its own end, so a block takes its end's hour,
+# rounded up
+def fetch_forecast(points: list[WeatherPoint]) -> list[tuple]:
+    fetched_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    places = request(forecast_url, points, minutely_15=",".join(variables), hourly="precipitation_probability",
+                     forecast_days=forecast_days)
+
+    rows = []
+    for point, place in zip(points, places):
+        blocks, hours = place["minutely_15"], place["hourly"]
+        chance = dict(zip(hours["time"], hours["precipitation_probability"]))
+        for i, stamp in enumerate(blocks["time"]):
+            end = datetime.fromisoformat(stamp)
+            hour = end if end.minute == 0 else end.replace(minute=0) + timedelta(hours=1)
+            values = {variable: blocks[variable][i] for variable in variables}
+            rows.append((*row(point, local_time(stamp), fetched_at, values), chance.get(hour.strftime("%Y-%m-%dT%H:%M"))))
+
+    return rows
+
+
+# Fetch the forecast, overwrite the stored one, and drop days before today. Raises on failure.
+# Returns the rows fetched
+def update_forecast(conn, points: list[WeatherPoint], today: date) -> list[tuple]:
+    database.record_request(conn, "open_meteo", len(points))
+    rows = fetch_forecast(points)
+    store.add_forecast(conn, rows)
+    store.drop_past_forecasts(conn, today)
+    return rows
+
+
+# "next 36 h: rain chance up to 40%, gusts up to 30 km/h" from forecast rows
+def describe_forecast(rows: list[tuple], hours: int = 36) -> str:
+    now = datetime.now().astimezone()
+    ahead = [r for r in rows if now <= datetime.fromisoformat(r[1]) <= now + timedelta(hours=hours)]
+    gust = 3 + store.weather_columns.index("gust_kmh")
+    chance = max((r[-1] for r in ahead if r[-1] is not None), default=0)
+    gusts = max((r[gust] for r in ahead if r[gust] is not None), default=0)
+    return f"next {hours} h: rain chance up to {chance:.0f}%, gusts up to {gusts:.0f} km/h"
+
+
 # Live weather at the route's points, read every WEATHER_EVERY_MIN from reading_offset_min
 # past the hour, and yesterday's archive at the first reading after midnight, so readings
-# that failed leave no gap. main.py calls on_slot each slot; a failure is logged and never
-# stops drive-time sampling
+# that failed leave no gap. The forecast is refreshed every FORECAST_EVERY_MIN on the same
+# clock times. main.py calls on_slot each slot; a failure is logged and never stops
+# drive-time sampling
 class WeatherCollector:
 
     def __init__(self, conn, home: Location, uni: Location, tomtom_key: str, interval_min: int):
         self.conn, self.home, self.uni, self.tomtom_key = conn, home, uni, tomtom_key
         self.every_min = every_min(interval_min)
+        self.forecast_every_min = every_min(interval_min, "FORECAST_EVERY_MIN", default_forecast_every_min)
 
         store.create_tables(conn)
-        self.points = route_points.load_or_make(conn, home, uni, tomtom_key) if self.every_min else []
+        needed = self.every_min or self.forecast_every_min
+        self.points = route_points.load_or_make(conn, home, uni, tomtom_key) if needed else []
 
     def log_plan(self):
-        if not self.every_min:
-            logger.info("Weather: off (WEATHER_EVERY_MIN=off)")
+        if not self.every_min and not self.forecast_every_min:
+            logger.info("Weather: off (WEATHER_EVERY_MIN=off, FORECAST_EVERY_MIN=off)")
             return
 
         if not self.points:
             logger.warning("Weather: no points along the route yet; trying again at the next reading")
             return
 
-        # Readings, plus one archive request a day
-        per_day = len(self.points) * (24 * 60 // self.every_min + 1)
+        # Readings plus one archive request a day, and forecast refreshes
+        readings = len(self.points) * (24 * 60 // self.every_min + 1) if self.every_min else 0
+        forecasts = len(self.points) * (24 * 60 // self.forecast_every_min) if self.forecast_every_min else 0
         used = database.requests_this_month(self.conn, "open_meteo")
-        logger.info(f"Weather: {len(self.points)} points along the route every {self.every_min} min from "
-                    f":{reading_offset_min:02}, and yesterday's archive at 00:{reading_offset_min:02}; "
-                    f"~{per_day:,} Open-Meteo calls a day of {daily_limit:,} free ({used:,} this month)")
+
+        if self.every_min:
+            logger.info(f"Weather: {len(self.points)} points along the route every {self.every_min} min from "
+                        f":{reading_offset_min:02}, and yesterday's archive at 00:{reading_offset_min:02}")
+        else:
+            logger.info("Weather readings: off (WEATHER_EVERY_MIN=off)")
+        if self.forecast_every_min:
+            logger.info(f"Forecast: refreshed every {self.forecast_every_min} min from :{reading_offset_min:02},"
+                        f" today through tomorrow evening, past days dropped")
+        else:
+            logger.info("Forecast: off (FORECAST_EVERY_MIN=off)")
+        logger.info(f"Open-Meteo: ~{readings + forecasts:,} calls a day of {daily_limit:,} free ({used:,} this month)")
 
         # Leave room for backfill_weather and manual checks on the same allowance
-        if per_day > daily_limit * 0.8:
-            logger.warning("Weather readings use most of Open-Meteo's daily allowance. Raise WEATHER_EVERY_MIN in .env")
+        if readings + forecasts > daily_limit * 0.8:
+            logger.warning("Weather uses most of Open-Meteo's daily allowance. Raise WEATHER_EVERY_MIN or FORECAST_EVERY_MIN in .env")
 
     def on_slot(self, slot: datetime):
-        if not self.every_min or (slot.minute - reading_offset_min) % self.every_min:
+        reading = self.every_min and (slot.minute - reading_offset_min) % self.every_min == 0
+        forecasting = self.forecast_every_min and (slot.minute - reading_offset_min) % self.forecast_every_min == 0
+        if not reading and not forecasting:
             return
 
         # Route request failed earlier (e.g. no network at boot): try again
@@ -164,10 +229,13 @@ class WeatherCollector:
             if not self.points:
                 return
 
-        self.read_current()
+        if reading:
+            self.read_current()
+            if slot.hour == 0 and slot.minute == reading_offset_min:
+                self.archive_day(slot.date() - timedelta(days=1))
 
-        if slot.hour == 0 and slot.minute == reading_offset_min:
-            self.archive_day(slot.date() - timedelta(days=1))
+        if forecasting:
+            self.refresh_forecast(slot.date())
 
     def read_current(self):
         try:
@@ -184,6 +252,14 @@ class WeatherCollector:
 
         except Exception as err:
             logger.error(f"Weather failed: {describe_error(err)}")
+
+    def refresh_forecast(self, today: date):
+        try:
+            rows = update_forecast(self.conn, self.points, today)
+            logger.info(f"Forecast updated, {describe_forecast(rows)} ({len(rows):,} blocks)")
+
+        except Exception as err:
+            logger.error(f"Forecast failed: {describe_error(err)}")
 
     # A local day's blocks from the archive. A live reading of the same block is kept too,
     # and the analysis prefers it

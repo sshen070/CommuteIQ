@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 # Tables and queries for weather. CREATE TABLE IF NOT EXISTS adds them to an existing
 # database without touching the drive-time tables.
@@ -61,6 +61,28 @@ def create_tables(conn):
 
         UNIQUE (point_id, source, observed_at)
     );
+
+    -- The latest Open-Meteo forecast per point and 15-minute block, from the start of today
+    -- through tomorrow evening. Each refresh overwrites the blocks with the newer forecast
+    -- and drops the days before today, so this holds only what's still ahead or today's;
+    -- weather_samples keeps what actually happened. Same columns and units
+    CREATE TABLE IF NOT EXISTS weather_forecasts (
+        point_id INTEGER NOT NULL REFERENCES weather_points(id),
+        valid_at TEXT NOT NULL,         -- end of the block, local ISO-8601 like observed_at
+        fetched_at TEXT NOT NULL,       -- when this forecast was fetched
+
+        precip_mm REAL,
+        weather_code INTEGER,
+        visibility_m REAL,
+        temp_c REAL,
+        cloud_cover_pct REAL,
+        wind_kmh REAL,
+        gust_kmh REAL,
+        wind_dir_deg REAL,
+        precip_prob_pct REAL,           -- chance of 0.1 mm or more in the block's hour
+
+        PRIMARY KEY (point_id, valid_at)
+    );
     """)
 
 
@@ -106,3 +128,27 @@ def add_weather(conn, rows: list[tuple], source: str):
         [(row[0], source, *row[1:]) for row in rows]
     )
     conn.commit()
+
+
+# rows: (point_id, valid_at, fetched_at, *weather_columns, precip_prob_pct). A block fetched
+# again is overwritten, so each block keeps the newest forecast
+def add_forecast(conn, rows: list[tuple]):
+    columns = [*weather_columns, "precip_prob_pct"]
+    updates = ", ".join(f"{column} = excluded.{column}" for column in ["fetched_at", *columns])
+
+    conn.executemany(
+        f"""
+        INSERT INTO weather_forecasts (point_id, valid_at, fetched_at, {", ".join(columns)})
+        VALUES (?, ?, ?, {", ".join("?" * len(columns))})
+        ON CONFLICT (point_id, valid_at) DO UPDATE SET {updates}
+        """,
+        rows
+    )
+    conn.commit()
+
+
+# Forecast blocks from local days before today, which weather_samples now covers. Returns how many
+def drop_past_forecasts(conn, today: date) -> int:
+    count = conn.execute("DELETE FROM weather_forecasts WHERE substr(valid_at, 1, 10) < ?", (today.isoformat(),)).rowcount
+    conn.commit()
+    return count
