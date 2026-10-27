@@ -1,0 +1,26 @@
+# Wi-Fi watchdog: reconnects the Wi-Fi, and reboots as a last resort, when the server
+# can't reach its router (see deploy/wifi-watchdog.sh). The script is copied out of the
+# repo, so later edits take effect only when it's installed again.
+#
+# Install:  sudo install -m 755 deploy/wifi-watchdog.sh /usr/local/bin/wifi-watchdog
+#           sudo cp deploy/wifi-watchdog.service /etc/systemd/system/
+#           sudo systemctl daemon-reload
+#           sudo systemctl enable --now wifi-watchdog
+#
+# Status:   systemctl status wifi-watchdog
+# Actions:  cat /var/lib/wifi-watchdog/events.log    (kept across reboots)
+# Disable:  sudo systemctl disable --now wifi-watchdog
+
+[Unit]
+Description=Wi-Fi watchdog: reconnect or reboot when the router stops answering
+After=NetworkManager.service
+
+[Service]
+ExecStart=/usr/local/bin/wifi-watchdog
+StateDirectory=wifi-watchdog
+
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
