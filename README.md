@@ -16,6 +16,10 @@ From 11 Monday–Thursday class days with samples from both services (Oct 5 – 
 | Google vs TomTom, matched by day and departure time | Google reads a median **3 min** higher, and 7–13 min higher 1 time in 10 |
 | Holiday effect (Columbus Day / Indigenous Peoples' Day) | 3–4 min faster than an average Mon–Thu in both directions |
 | Rain (5 light rainy days so far) | No slowdown yet. The drive home met a headwind on 4 of the 5 days |
+| Rain and wind (Google, per drive vs dry days at the same time) | Rain on the drive: **+7%** (about +4 min on an hour's drive), at every light-rain rate seen so far. Wet road after it: +4.5%. Gusts of 40 mph: +7%. Rough: 3 rainy and 4 windy days |
+| Backtest: the leave-by advice on days it didn't learn from | On time **93–98%** of the time by style and route (a p90 rule aims for 90%), at most 7 min late |
+| Backtest: adding the day's weather to the advice | On rainy or windy stretches, on time **85% → 98%** testing forward in time, with the worst miss 7 → 0.6 min. Calm days unchanged |
+| Backtest: waiting at campus to drive home | Saves what it promises on average (10–14 min), but on the toll route at most a third of waits saved 10+ min on the day |
 
 ## How it works
 
@@ -31,6 +35,7 @@ Open-Meteo ─────┘
 - Samples inside configurable commute windows (05:00–14:00 toward campus, 12:00–21:00 toward home), plus "baseline weeks" sampled around the clock for a full-day picture. Google samples on weekdays.
 - Measures each route once from TomTom at 03:00: how many miles are freeway and how long the freeway part takes on an open road.
 - Every 15 minutes, records weather at 16 fixed points spaced 5 km apart along the route. Past weather is backfilled from Open-Meteo's archive.
+- Every hour, refreshes the forecast at the same points for today through tomorrow evening, including the chance of rain. Each refresh overwrites the last one, so a 40% chance of rain at dawn that becomes 90% by mid-morning reaches the advice.
 - Built to run unattended:
   - A failed request is logged and skipped, never fatal.
   - If the clock jumps, a slot is skipped rather than sampled late.
@@ -46,6 +51,9 @@ Open-Meteo ─────┘
 - **Leave-by time:** the latest slot whose p90 drive still arrives a set buffer before class, provided every earlier slot in the 4 hours before class also makes it. That way one lucky late slot isn't recommended over an unlucky earlier one.
 - **Heading home:** leave right after class, unless waiting up to 3 hours cuts the median drive by at least 10 minutes.
 - **Day log:** compares each day with the average of the other days in its group at the same departure times. It lines that up with rain, length of the dry spell before it, visibility, wind, heat, holidays and the academic calendar, plus a rain-and-wind table per direction.
+- **Weather as a model input:** drive time = the dry-day time for that weekday and departure slot × (1 + the weather's effect), fitted per drive on rain falling, a wet road after it, and gust strength. Neither service models weather, but both see traffic slow in it. `commute_stats.py` applies the stored forecast for the day by default, slot by slot. The forecast is read as the car would pass each point, and a 40% chance of rain counts 40% of the rain effect. `--rain` and `--gust` give a what-if instead.
+- **Room to grow:** the weather model is one swappable piece. A more flexible one (gradient boosting, quantile regression, a neural net) replaces it only once it beats it on weather days it didn't learn from. With 6 weather days so far, a more flexible version already does worse.
+- **Backtest:** works out each day's advice from other days only, forward in time and leave-one-day-out, then checks it against that day's drives. It reports the on-time rate, minutes to spare, driving really saved by leaving earlier or waiting, and every departure slot's drive against the advised p90. It compares advice with and without the day's weather, and lists misses next to the day's weather and calendar.
 - **Per-drive features:** the weather at each route point at the moment the car would pass it, including headwind and crosswind gusts where it was raining, and sun glare (km of road heading into a low sun, from NOAA solar equations). These are exported as CSVs for later modeling.
 
 ## APIs
@@ -56,7 +64,7 @@ Open-Meteo ─────┘
 | TomTom Routing | A second live-traffic drive time, a lower bound in traffic; each route's freeway profile | Since Sep 30, 2026 |
 | TomTom Search | Place search and reverse geocoding during setup | In use |
 | Google Places (New) | Setup's place search when a Google key is set; it finds places TomTom doesn't index, such as individual parking lots | Optional |
-| Open-Meteo Forecast + Historical Forecast | Weather at 16 points along the route, live and archived | In use, no key needed |
+| Open-Meteo Forecast + Historical Forecast | Weather at 16 points along the route: live, archived, and the forecast for today and tomorrow | In use, no key needed |
 
 So far: about 17,500 TomTom and 11,700 Google drive-time samples, and 236,000 weather readings.
 
@@ -85,6 +93,14 @@ sudo systemctl daemon-reload && sudo systemctl enable --now commuteiq
 journalctl -u commuteiq -f
 ```
 
+On Wi-Fi, optionally add the watchdog. It reconnects the Wi-Fi when the router stops answering, and reboots as a last resort:
+
+```sh
+sudo install -m 755 deploy/wifi-watchdog.sh /usr/local/bin/wifi-watchdog
+sudo cp deploy/wifi-watchdog.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now wifi-watchdog
+```
+
 Locally, without Docker:
 
 ```sh
@@ -99,9 +115,11 @@ Analysis (it reads the database read-only, so it's safe while the collector runs
 ```sh
 pip install -r analysis/requirements.txt
 cd analysis
-python commute_stats.py      # leave-by times; --class-start 09:30 --class-end 15:20 --buffer 15 --style defensive
+python commute_stats.py      # leave-by times with today's forecast; --date tomorrow, --class-start 09:30 --buffer 15 --style defensive
 python plot_drive_times.py   # one chart per direction, in analysis/output/
 python day_log.py            # one line per day: weather, calendar, how it compared
+python backtest.py           # the advice checked on days it didn't learn from; --mode forward / leave-one-out
+python weather_model.py      # how rain and wind slow the drive; then e.g. commute_stats.py --rain 0.05 --gust 40
 ```
 
 `.env.example` documents every setting: sampling windows, baseline weeks, toll routes, weather interval and API budgets.
@@ -111,8 +129,8 @@ python day_log.py            # one line per day: weather, calendar, how it compa
 ```
 backend/app/              collector: main loop, TomTom/Google clients, route profiles, SQLite schema, setup
 backend/app/conditions/   weather points along the route, Open-Meteo client, backfill
-analysis/                 shared loader, driving styles, leave-by stats, charts, day log, features, calendar.csv
-deploy/                   systemd unit
+analysis/                 shared loader, driving styles, weather model, leave-by stats, backtest, charts, day log, features, calendar.csv
+deploy/                   systemd units: the collector, and a Wi-Fi watchdog
 Dockerfile, docker-compose.yml
 ```
 
@@ -120,6 +138,6 @@ Dockerfile, docker-compose.yml
 
 - **Phase 1, reliable collector:** done.
 - **Phase 2, collecting class weeks:** in progress, with a second baseline week Nov 2–8.
-- **Phase 3, leave-by recommendations:** the scripts are in place. The p90s mean more once each slot has 10+ days of data, and the scripts warn until then. Next: test the leave-by rule on days held out of the data, and log real drives to check the driving styles.
+- **Phase 3, leave-by recommendations:** the scripts are in place. The p90s mean more once each slot has 10+ days of data, and the scripts warn until then. The backtest checks the advice against the estimates on days it didn't learn from, and weather enters as a scale factor. The advice follows the stored forecast. Next: log real drives to check the driving styles, which the estimates can't confirm.
 
 Home and campus locations stay in `.env` and the database, both gitignored, as does analysis output.
