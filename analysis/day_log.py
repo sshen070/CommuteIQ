@@ -270,7 +270,7 @@ def main():
     columns = [
         "departure_date", "departure_weekday", "departure_time", "direction", "route",
         "travel_min", "day_group", "base_days", "avg_min", "diff_min", "in_window",
-        "precip_mm", "wet_share", "wet_road_mm", "weather_code", "visibility_km", "gust_kmh",
+        "precip_mm", "rain_mm_h", "wet_share", "wet_road_mm", "weather_code", "visibility_km", "gust_kmh",
         "rain_headwind_kmh", "rain_cross_gust_kmh", "temp_c",
         "cloud_cover_pct", "dry_days", "sun_elev", "glare_km", "dark_km",
         "holiday", "days_to_holiday", "uni", "k12_break", "notes", "dst_days",

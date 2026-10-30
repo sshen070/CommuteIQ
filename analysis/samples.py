@@ -184,17 +184,16 @@ def load_profiles() -> pd.DataFrame:
 
 # Median and spread of travel time per (source, leg, toll option, departure slot)
 def slot_stats(df: pd.DataFrame) -> pd.DataFrame:
-    return (
-        df.groupby(["source", "origin", "destination", "allow_tolls", "slot"])
-        .agg(
-            days=("departure_date", "nunique"),
-            samples=("travel_min", "size"),
-            median=("travel_min", "median"),
-            p10=("travel_min", lambda s: s.quantile(0.10)),
-            p90=("travel_min", lambda s: s.quantile(0.90)),
-        )
-        .reset_index()
-    )
+    # Grouped quantile instead of a lambda per group: same numbers, fast enough for
+    # backtest.py, which recomputes these for every held-out day
+    groups = df.groupby(["source", "origin", "destination", "allow_tolls", "slot"])
+    return pd.DataFrame({
+        "days": groups["departure_date"].nunique(),
+        "samples": groups["travel_min"].size(),
+        "median": groups["travel_min"].median(),
+        "p10": groups["travel_min"].quantile(0.10),
+        "p90": groups["travel_min"].quantile(0.90),
+    }).reset_index()
 
 
 def coverage_label(df: pd.DataFrame) -> str:

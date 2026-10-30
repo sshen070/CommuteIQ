@@ -45,10 +45,11 @@ weather_columns = [
 no_weather = "No weather in the database yet. Run python -m conditions.backfill_weather (see CLAUDE.md)."
 
 
-# TomTom samples between the active home and uni, the weather points along the route, and
-# their weather (one reading per point and 15-minute block, live preferred over archive).
-# The points' rounded coordinates stay in memory and are never printed or written
-def load() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+# TomTom samples between the active home and uni (plus Google's best guess with google set,
+# told apart by source), the weather points along the route, and their weather (one reading
+# per point and 15-minute block, live preferred over archive). The points' rounded
+# coordinates stay in memory and are never printed or written
+def load(google: bool = False) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     load_dotenv(samples.repo_root / ".env")
     path = Path((os.getenv("DB_PATH") or "").strip() or samples.default_db_path).resolve()
 
@@ -63,14 +64,13 @@ def load() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         if "HOME" not in active or "UNI" not in active:
             sys.exit("Home/university locations are not set. Run setup_locations.py first.")
 
-        df = pd.read_sql_query(
-            """
-            SELECT origin_id, destination_id, allow_tolls, departure_at,
-                   departure_date, departure_weekday, departure_time, travel_time_s
-            FROM commute_samples
-            """,
-            conn,
-        )
+        columns = "origin_id, destination_id, allow_tolls, departure_at, departure_date, departure_weekday, departure_time, travel_time_s"
+        df = pd.read_sql_query(f"SELECT {columns}, 'TomTom' AS source FROM commute_samples", conn)
+        if google:
+            google_df = pd.read_sql_query(
+                f"SELECT {columns}, 'Google' AS source FROM google_samples WHERE traffic_model = 'BEST_GUESS'", conn
+            )
+            df = pd.concat([df, google_df], ignore_index=True)
 
         # The weather tables appear once the collector or backfill_weather has run
         if not conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'weather_points'").fetchone():
@@ -123,6 +123,35 @@ def load() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     return df.drop(columns=["origin_id", "destination_id", "departure_at", "travel_time_s"]), points, weather
 
 
+# The stored forecast (weather_forecasts, kept current by the collector) at the active pair's
+# points, shaped like load()'s weather: point_id, time (UTC block end), weather_columns,
+# precip_prob_pct and fetched_at. Also the points, as load() returns them. Both empty until
+# the collector has fetched a forecast
+def load_forecast() -> tuple[pd.DataFrame, pd.DataFrame]:
+    columns = ["point_id", "time", *weather_columns, "precip_prob_pct", "fetched_at"]
+    with closing(samples.connect()) as conn:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'weather_forecasts'").fetchone():
+            return pd.DataFrame(columns=columns), pd.DataFrame(columns=["point_id", "route_km", "lat", "lon"])
+
+        active = dict(conn.execute("SELECT role, MAX(id) FROM locations GROUP BY role").fetchall())
+        pair = (active.get("HOME"), active.get("UNI"))
+        points = pd.read_sql_query(
+            "SELECT id AS point_id, route_km, lat, lon FROM weather_points WHERE home_id = ? AND uni_id = ? ORDER BY seq",
+            conn, params=pair,
+        )
+        forecast = pd.read_sql_query(
+            f"""
+            SELECT point_id, valid_at, fetched_at, {", ".join(weather_columns)}, precip_prob_pct
+            FROM weather_forecasts
+            WHERE point_id IN (SELECT id FROM weather_points WHERE home_id = ? AND uni_id = ?)
+            """,
+            conn, params=pair,
+        )
+
+    forecast["time"] = pd.to_datetime(forecast["valid_at"], utc=True)
+    return forecast[columns], points
+
+
 # Initial compass bearing between points, in degrees (works on arrays)
 def bearing(lat1, lon1, lat2, lon2):
     lat1, lon1, lat2, lon2 = (np.radians(np.asarray(v, dtype=float)) for v in (lat1, lon1, lat2, lon2))
@@ -161,6 +190,7 @@ def stops(df: pd.DataFrame, line: pd.DataFrame) -> pd.DataFrame:
 
 # Weather the drive went through: each point's 15-minute block when the car passed it.
 # Worst along the way for rain, visibility and gusts; average for temperature and cloud.
+# rain_mm_h is the rain rate averaged over the points as they're passed (mm per hour).
 # Wind against the car, only on stretches where rain was falling (NaN on a dry drive):
 # rain_headwind_kmh is the km-weighted mean headwind (+ into the wind, - tailwind; the wind
 # direction is where it blows from, so a wind from the heading is a headwind), and
@@ -177,6 +207,7 @@ def trip_weather(trips: pd.DataFrame, weather: pd.DataFrame) -> pd.DataFrame:
         weather[["point_id", "time", "wet_road_mm", *weather_columns]], on=["point_id", "time"], how="left"
     )
     passed["wet"] = np.where(passed["precip_mm"].isna(), np.nan, passed["precip_mm"] >= wet_block_mm)
+    passed["rain_mm_h"] = passed["precip_mm"] * 4
 
     raining = passed["precip_mm"] >= wet_block_mm
     offset = np.radians(passed["wind_dir_deg"] - passed["heading"])
@@ -187,6 +218,7 @@ def trip_weather(trips: pd.DataFrame, weather: pd.DataFrame) -> pd.DataFrame:
 
     out = passed.groupby("sample").agg(
         precip_mm=("precip_mm", "max"),
+        rain_mm_h=("rain_mm_h", "mean"),
         wet_share=("wet", "mean"),
         wet_road_mm=("wet_road_mm", "max"),
         weather_code=("weather_code", "max"),
@@ -296,14 +328,19 @@ def build(df: pd.DataFrame, points: pd.DataFrame, weather: pd.DataFrame) -> tupl
     return df, days
 
 
-# Local departures (minutes after midnight) on a date that would drive into a low sun, with
-# the km of glare. typical_min maps each departure slot to its usual drive time, which sets
-# when each stretch is reached
-def glare_departures(day: date, origin: str, line: pd.DataFrame, typical_min: pd.Series) -> dict[int, float]:
-    departures = pd.date_range(f"{day} 00:00", f"{day} 23:55", freq="5min", tz=local_tz)
+# A departure from origin at every slot of a local date, as stops() takes them. typical_min
+# maps each slot to its usual drive time (the median elsewhere), which sets when each stretch
+# is reached. Index = departure minute after midnight
+def planned_trips(day: date, origin: str, typical_min: pd.Series) -> pd.DataFrame:
+    departures = pd.date_range(f"{day} 00:00", f"{day} 23:55", freq=f"{samples.slot_min}min", tz=local_tz)
     minutes = departures.hour * 60 + departures.minute
     travel = (minutes // samples.slot_min * samples.slot_min).map(typical_min).fillna(typical_min.median())
+    return pd.DataFrame({"origin": origin, "departure_utc": departures.tz_convert("UTC"), "travel_min": travel.to_numpy()},
+                        index=minutes)
 
-    planned = pd.DataFrame({"origin": origin, "departure_utc": departures.tz_convert("UTC"), "travel_min": travel.to_numpy()})
-    sun = trip_sun(stops(planned, line))
-    return {int(minutes[i]): km for i, km in sun["glare_km"].items() if km > 0}
+
+# Local departures (minutes after midnight) on a date that would drive into a low sun, with
+# the km of glare
+def glare_departures(day: date, origin: str, line: pd.DataFrame, typical_min: pd.Series) -> dict[int, float]:
+    sun = trip_sun(stops(planned_trips(day, origin, typical_min), line))
+    return {int(minute): km for minute, km in sun["glare_km"].items() if km > 0}
