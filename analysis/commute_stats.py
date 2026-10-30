@@ -1,11 +1,18 @@
+from datetime import date, timedelta
+
 import argparse
+import day_log
 import driving_styles
+import features
 import pandas as pd
 import samples
 import sys
+import weather_model
 
 # Statistics behind the departure decision, per direction, toll option and driving style
-# (driving_styles.py: Google-led blends of Google and TomTom, matched by day and slot):
+# (driving_styles.py: Google-led blends of Google and TomTom, matched by day and slot),
+# scaled per slot to the weather (weather_model.py): the stored forecast for --date, or a
+# what-if:
 #   - Home -> Uni: latest safe departure for each class start (p90 drive time)
 #   - Uni -> Home: leave right after class, or wait at uni for traffic to ease?
 # Also writes output/slot_stats.csv with every slot's numbers, per source and style.
@@ -43,6 +50,35 @@ def parse_style(text: str) -> driving_styles.Style:
         names = ", ".join(style.name.lower() for style in driving_styles.styles)
         raise argparse.ArgumentTypeError(f"unknown driving style {text!r}; use {names}")
     return matches[0]
+
+
+# argparse type: "today", "tomorrow" or YYYY-MM-DD -> date
+def parse_date(text: str) -> date:
+    text = text.strip().lower()
+    if text in ("today", "tomorrow"):
+        return date.today() + timedelta(days=text == "tomorrow")
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected today, tomorrow or YYYY-MM-DD (got {text!r})")
+
+
+# "forecast for Tue Oct 27 (updated Mon 15:04): Home → Uni rain chance up to 40%, ...", over
+# each direction's commute window
+def forecast_note(day: date, factors: pd.DataFrame, model) -> str:
+    parts = []
+    for origin, destination in samples.legs:
+        if origin not in factors.index.get_level_values("origin"):
+            continue
+        start, end = day_log.window(origin, destination)
+        leg = factors.loc[origin]
+        leg = leg[(leg.index >= start) & (leg.index < end)]
+        if not leg.empty:
+            parts.append(f"{samples.leg_name(origin, destination)} rain chance up to {leg['rain_chance'].max():.0%},"
+                         f" gusts up to {leg['gust_kmh'].max() / weather_model.km_per_mile:.0f} mph,"
+                         f" drives up to ×{leg['factor'].max():.3f}")
+    updated = pd.Timestamp(factors["fetched_at"].max()).strftime("%a %H:%M")
+    return f"forecast for {day:%a %b} {day.day} (updated {updated}): {'; '.join(parts)}; model {model.basis()}"
 
 
 # One leg, toll option and source or style, indexed by slot (minutes after midnight)
@@ -139,9 +175,8 @@ def heading_home(series: pd.DataFrame, class_end: int) -> tuple[pd.Series, pd.Se
 #                   f" up to {saved.max():.0f} min at {samples.hhmm(saved.idxmax())}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Departure statistics and leave-by times for both directions.")
-    samples.add_days_argument(parser)
+# Class times, buffer and styles: shared with backtest.py, which checks the same advice
+def add_advice_arguments(parser: argparse.ArgumentParser):
     parser.add_argument("--class-start", type=samples.parse_hhmm, nargs="+", default=default_class_starts,
                         metavar="HH:MM", help="first class start time(s); default 08:00 to 12:00 every 30 min")
     parser.add_argument("--class-end", type=samples.parse_hhmm, nargs="+", default=default_class_ends,
@@ -150,8 +185,23 @@ def main():
                         help="minutes to park and walk to class (default 15)")
     parser.add_argument("--style", type=parse_style, nargs="+", default=driving_styles.styles, metavar="STYLE",
                         help="driving style(s) to show: aggressive, defensive, relaxed (default: all)")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Departure statistics and leave-by times for both directions.")
+    samples.add_days_argument(parser)
+    add_advice_arguments(parser)
+    parser.add_argument("--rain", type=float, default=0, metavar="IN/H",
+                        help="what-if: rain falling during the drive, in inches an hour (so far any rate counts the same)")
+    parser.add_argument("--wet-road", action="store_true", help="what-if: the rain has stopped but the road is still wet")
+    parser.add_argument("--gust", type=float, default=0, metavar="MPH", help="what-if: the strongest gust during the drive")
+    parser.add_argument("--date", type=parse_date, default=date.today(), metavar="DAY",
+                        help="the day whose stored forecast to use: today (default), tomorrow or YYYY-MM-DD")
+    parser.add_argument("--no-forecast", action="store_true", help="use the drives as sampled, without the forecast")
     args = parser.parse_args()
     chosen = [style for style in driving_styles.styles if style in args.style]
+    if args.rain < 0 or args.gust < 0:
+        parser.error("--rain and --gust can't be negative")
 
     df = samples.load(args.days, google=True)
     profiles = samples.load_profiles()
@@ -163,6 +213,38 @@ def main():
     if styled.empty:
         sys.exit(f"No {samples.days_label(args.days)} days with both Google and TomTom samples yet,"
                  " so driving styles can't be computed. Add GOOGLE_CLOUD_API_KEY to .env and let the collector run.")
+
+    # The drives as sampled (nearly all dry and calm so far), scaled per slot to the weather:
+    # a what-if, which holds for every departure, or else the stored forecast for --date.
+    # Taking each drive's own weather out first was tested and lost the margin the few
+    # weather days give the p90 (see CLAUDE.md)
+    factor_by_origin = {}
+    asked = [f"rain {args.rain:g} in/h" if args.rain else "", "wet road" if args.wet_road and not args.rain else "",
+             f"gusts {args.gust:g} mph" if args.gust else ""]
+    if asked := ", ".join(part for part in asked if part):
+        model = weather_model.fit(weather_model.with_delay(weather_model.google_weather()))
+        conditions = dict(rain_mm_h=args.rain * weather_model.mm_per_inch,
+                          wet_road_mm=1 if args.rain or args.wet_road else 0,
+                          gust_kmh=args.gust * weather_model.km_per_mile)
+        factor = model.factor(**conditions)
+        low, high = model.factor_range(**conditions)
+        factor_by_origin = {"HOME": factor, "UNI": factor}
+        weather_note = f"{asked}: every drive ×{factor:.3f} (×{low:.3f}–{high:.3f}), {model.basis()}"
+    elif args.no_forecast:
+        weather_note = "as sampled (--no-forecast)"
+    elif (forecast := features.load_forecast())[0].empty:
+        weather_note = "as sampled: no forecast stored yet (python -m conditions.forecast in backend/app)"
+    else:
+        model = weather_model.fit(weather_model.with_delay(weather_model.google_weather()))
+        google = df[(df["source"] == "Google") & (df["allow_tolls"] == 0)]
+        typical = {origin: group.groupby("slot")["travel_min"].median() for origin, group in google.groupby("origin")}
+        factors = weather_model.forecast_factors(args.date, model, typical, *forecast)
+        if factors.empty:
+            weather_note = f"as sampled: the stored forecast doesn't reach {args.date}"
+        else:
+            factor_by_origin = {origin: factors.loc[origin, "factor"] for origin in factors.index.get_level_values("origin").unique()}
+            weather_note = forecast_note(args.date, factors, model)
+
     stats = samples.slot_stats(styled)
     style_names = [style.name for style in chosen]
 
@@ -175,6 +257,10 @@ def main():
     if tomtom_only := sorted(set(df["departure_date"]) - set(styled["departure_date"])):
         print(f"Note: left out {len(tomtom_only)} day{'s' if len(tomtom_only) != 1 else ''} without both"
               f" Google and TomTom samples ({', '.join(tomtom_only)}).")
+    print(f"Weather: {weather_note}.")
+    if args.date.strftime("%A") not in args.days:
+        print(f"Note: {args.date:%A} isn't among the pooled days ({samples.days_label(args.days)});"
+              f" try --days {args.date.strftime('%a').lower()}.")
 
     print(f"\nDriving style{'s' if len(chosen) != 1 else ''} (drive times lean on Google; see driving_styles.py):")
     for style in chosen:
@@ -216,7 +302,7 @@ def main():
         for class_start in sorted(args.class_start):
             row = [samples.hhmm(class_start)]
             for name in style_names:
-                series = series_for(stats, "HOME", "UNI", tolls, name)
+                series = weather_model.scale(series_for(stats, "HOME", "UNI", tolls, name), factor_by_origin.get("HOME", 1))
                 result = leave_by(series, class_start, args.buffer)
                 if isinstance(result, str):
                     row.append(result)
@@ -239,7 +325,8 @@ def main():
         for class_end in sorted(args.class_end):
             row = [samples.hhmm(class_end)]
             for name in style_names:
-                if (result := heading_home(series_for(stats, "UNI", "HOME", tolls, name), class_end)) is None:
+                series = weather_model.scale(series_for(stats, "UNI", "HOME", tolls, name), factor_by_origin.get("UNI", 1))
+                if (result := heading_home(series, class_end)) is None:
                     row.append("no data")
                     continue
                 now, best = result
