@@ -1,8 +1,6 @@
 .env
 .venv/
-backend/app/__pycache__/
+__pycache__/
 data/
 CLAUDE.md
 analysis/output/
-analysis/__pycache__/
-backend/app/conditions/__pycache__/

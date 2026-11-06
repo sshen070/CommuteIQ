@@ -43,6 +43,12 @@ Open-Meteo ─────┘
   - It tracks each API's free-tier budget and Google trial credits, and won't exceed them.
   - It redacts API keys from logs.
 
+**Real drives** (`backend/app/drives/`)
+
+- A Telegram bot, run as a thread of the collector, logs real drives with three buttons: *Home -> UNI* or *UNI -> Home* as you set off, and *Reached* once you've parked, which ends whichever drive is in progress. Telegram timestamps each tap to the second. After an arrival it asks which route you took, or whether you stopped on the way.
+- A drive you didn't tap goes in with `/adddrive home 07:31 08:19` (24-hour clock, optional day), which also corrects a logged drive's times. `/undo` takes back a mistaken tap.
+- It asks Telegram for new messages rather than waiting for them, so nothing on the server is reachable from the internet.
+
 **Analysis** (`analysis/`)
 
 - Buckets samples by direction, route (toll-free / tolls), day group (Mon–Thu, Fri, Sat, Sun) and 5-minute departure slot, and takes the median, p10 and p90 of each bucket.
@@ -51,10 +57,12 @@ Open-Meteo ─────┘
 - **Leave-by time:** the latest slot whose p90 drive still arrives a set buffer before class, provided every earlier slot in the 4 hours before class also makes it. That way one lucky late slot isn't recommended over an unlucky earlier one.
 - **Heading home:** leave right after class, unless waiting up to 3 hours cuts the median drive by at least 10 minutes.
 - **Day log:** compares each day with the average of the other days in its group at the same departure times. It lines that up with rain, length of the dry spell before it, visibility, wind, heat, holidays and the academic calendar, plus a rain-and-wind table per direction.
-- **Weather as a model input:** drive time = the dry-day time for that weekday and departure slot × (1 + the weather's effect), fitted per drive on rain falling, a wet road after it, and gust strength. Neither service models weather, but both see traffic slow in it. `commute_stats.py` applies the stored forecast for the day by default, slot by slot. The forecast is read as the car would pass each point, and a 40% chance of rain counts 40% of the rain effect. `--rain` and `--gust` give a what-if instead.
+- **Weather as a model input:** drive time = the dry-day time for that weekday and departure slot × (1 + the weather's effect), fitted per drive on rain falling, a wet road after it, and gust strength. Neither service models weather, but both see traffic slow in it. `commute_stats` applies the stored forecast for the day by default, slot by slot. The forecast is read as the car would pass each point, and a 40% chance of rain counts 40% of the rain effect. `--rain` and `--gust` give a what-if instead.
 - **Room to grow:** the weather model is one swappable piece. A more flexible one (gradient boosting, quantile regression, a neural net) replaces it only once it beats it on weather days it didn't learn from. With 6 weather days so far, a more flexible version already does worse.
 - **Backtest:** works out each day's advice from other days only, forward in time and leave-one-day-out, then checks it against that day's drives. It reports the on-time rate, minutes to spare, driving really saved by leaving earlier or waiting, and every departure slot's drive against the advised p90. It compares advice with and without the day's weather, and lists misses next to the day's weather and calendar.
 - **Per-drive features:** the weather at each route point at the moment the car would pass it, including headwind and crosswind gusts where it was raining, and sun glare (km of road heading into a low sun, from NOAA solar equations). These are exported as CSVs for later modeling.
+- **Nightly message:** at 21:10, just after the forecast refresh, a systemd timer sends tomorrow's advice to Telegram for your class times and driving style. Days without class get nothing.
+- **Real drives against the styles:** each logged drive is set against the three styles' estimates for the same day, route and departure slot, to find which style matches how you actually drive.
 
 ## APIs
 
@@ -65,6 +73,7 @@ Open-Meteo ─────┘
 | TomTom Search | Place search and reverse geocoding during setup | In use |
 | Google Places (New) | Setup's place search when a Google key is set; it finds places TomTom doesn't index, such as individual parking lots | Optional |
 | Open-Meteo Forecast + Historical Forecast | Weather at 16 points along the route: live, archived, and the forecast for today and tomorrow | In use, no key needed |
+| Telegram Bot API | Logging real drives, and the nightly advice message | Optional, free |
 
 So far: about 17,500 TomTom and 11,700 Google drive-time samples, and 236,000 weather readings.
 
@@ -101,6 +110,14 @@ sudo cp deploy/wifi-watchdog.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now wifi-watchdog
 ```
 
+Optionally, the Telegram bot and the nightly message. Make a bot with @BotFather, put its token in `.env` as `TELEGRAM_BOT_TOKEN`, rebuild and restart the collector, then message the bot. It replies with your chat id for `TELEGRAM_CHAT_ID`; restart once more. Set `CLASS_SCHEDULE` too, then:
+
+```sh
+pip install -r analysis/requirements.txt                        # into the venv the timer uses (.venv)
+sudo cp deploy/commuteiq-advice.service deploy/commuteiq-advice.timer /etc/systemd/system/   # edit paths and User first
+sudo systemctl daemon-reload && sudo systemctl enable --now commuteiq-advice.timer
+```
+
 Locally, without Docker:
 
 ```sh
@@ -110,16 +127,18 @@ python setup_locations.py
 python main.py
 ```
 
-Analysis (it reads the database read-only, so it's safe while the collector runs):
+Analysis (it reads the database read-only, so it's safe while the collector runs). Run it from `analysis/`, as modules:
 
 ```sh
 pip install -r analysis/requirements.txt
 cd analysis
-python commute_stats.py      # leave-by times with today's forecast; --date tomorrow, --class-start 09:30 --buffer 15 --style defensive
-python plot_drive_times.py   # one chart per direction, in analysis/output/
-python day_log.py            # one line per day: weather, calendar, how it compared
-python backtest.py           # the advice checked on days it didn't learn from; --mode forward / leave-one-out
-python weather_model.py      # how rain and wind slow the drive; then e.g. commute_stats.py --rain 0.05 --gust 40
+python -m reports.commute_stats      # leave-by times with today's forecast; --date tomorrow, --class-start 09:30 --buffer 15 --style defensive
+python -m reports.plot_drive_times   # one chart per direction, in analysis/output/
+python -m reports.day_log            # one line per day: weather, calendar, how it compared
+python -m reports.daily_advice --dry-run   # the nightly Telegram message, printed instead of sent
+python -m models.weather_model       # how rain and wind slow the drive; then e.g. reports.commute_stats --rain 0.05 --gust 40
+python -m validation.backtest        # the advice checked on days it didn't learn from; --mode forward / leave-one-out
+python -m validation.real_drives     # your logged drives against each driving style
 ```
 
 `.env.example` documents every setting: sampling windows, baseline weeks, toll routes, weather interval and API budgets.
@@ -127,10 +146,14 @@ python weather_model.py      # how rain and wind slow the drive; then e.g. commu
 ## Layout
 
 ```
-backend/app/              collector: main loop, TomTom/Google clients, route profiles, SQLite schema, setup
-backend/app/conditions/   weather points along the route, Open-Meteo client, backfill
-analysis/                 shared loader, driving styles, weather model, leave-by stats, backtest, charts, day log, features, calendar.csv
-deploy/                   systemd units: the collector, and a Wi-Fi watchdog
+backend/app/             collector: main loop, TomTom/Google clients, route profiles, SQLite schema, setup
+backend/app/conditions/  weather points along the route, Open-Meteo client, backfill
+backend/app/drives/      Telegram bot that logs real drives
+analysis/core/           loading samples, weather and sun features, the calendar (calendar.csv)
+analysis/models/         driving styles, weather model, advice rules
+analysis/reports/        leave-by tables, charts, day log, the nightly message
+analysis/validation/     backtest, real drives against the styles, the ML comparison
+deploy/                  systemd units: the collector, the nightly message timer, and a Wi-Fi watchdog
 Dockerfile, docker-compose.yml
 ```
 
@@ -138,6 +161,7 @@ Dockerfile, docker-compose.yml
 
 - **Phase 1, reliable collector:** done.
 - **Phase 2, collecting class weeks:** in progress, with a second baseline week Nov 2–8.
-- **Phase 3, leave-by recommendations:** the scripts are in place. The p90s mean more once each slot has 10+ days of data, and the scripts warn until then. The backtest checks the advice against the estimates on days it didn't learn from, and weather enters as a scale factor. The advice follows the stored forecast. Next: log real drives to check the driving styles, which the estimates can't confirm.
+- **Phase 3, leave-by recommendations:** the scripts are in place. The p90s mean more once each slot has 10+ days of data, and the scripts warn until then. The backtest checks the advice against the estimates on days it didn't learn from, and weather enters as a scale factor. The advice follows the stored forecast.
+- **Phase 4, answer daily:** a Telegram bot logs real drives, and a nightly message sends the next day's advice. Next: enough logged drives to check the driving styles, which the estimates alone can't confirm.
 
 Home and campus locations stay in `.env` and the database, both gitignored, as does analysis output.

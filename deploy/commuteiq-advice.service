@@ -1,0 +1,24 @@
+# CommuteIQ nightly advice: tomorrow's leave-by times to your Telegram chat
+# (analysis/reports/daily_advice.py). Started by commuteiq-advice.timer. It runs the analysis from the
+# repo with its venv, not the collector image, so analysis edits apply from the next run.
+#
+# Install:  edit User and the three /opt/CommuteIQ paths first (the repo and its .venv)
+#           sudo cp deploy/commuteiq-advice.service deploy/commuteiq-advice.timer /etc/systemd/system/
+#           sudo systemctl daemon-reload
+#           sudo systemctl enable --now commuteiq-advice.timer
+# Send now: sudo systemctl start commuteiq-advice
+# Next run: systemctl list-timers commuteiq-advice
+# Logs:     journalctl -u commuteiq-advice
+
+[Unit]
+Description=CommuteIQ: tomorrow's leave-by times to Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# Needs only read access to the database, like the other analysis scripts
+User=pi
+WorkingDirectory=/opt/CommuteIQ/analysis
+ExecStart=/opt/CommuteIQ/.venv/bin/python -m reports.daily_advice

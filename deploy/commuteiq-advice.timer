@@ -1,0 +1,13 @@
+# Runs commuteiq-advice.service every evening at 21:10, after the collector's 21:05 forecast
+# refresh. Days without class get no message (CLASS_SCHEDULE in .env). If the server was off
+# at 21:10, it runs once it's back; before noon that message is for the same day.
+
+[Unit]
+Description=CommuteIQ nightly advice at 21:10
+
+[Timer]
+OnCalendar=*-*-* 21:10:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
