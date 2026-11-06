@@ -14,7 +14,7 @@ import sys
 # per home/uni pair from TomTom's route at a quiet hour, both directions, toll-free and with
 # tolls (4 routing requests). Analysis uses it to turn a sample's drive time into freeway
 # traffic speed, and to work out what a driver's cruising speed changes
-# (analysis/driving_styles.py). The collector makes it on start; to make it without a
+# (analysis/models/driving_styles.py). The collector makes it on start; to make it without a
 # restart, run from backend/app:
 #   python route_profile.py
 # On the server, through the container, which owns the database file:

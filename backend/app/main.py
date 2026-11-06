@@ -8,6 +8,7 @@ from trip_route import TripRoute
 import config
 import ctypes
 import database
+import drives.bot
 import logging
 import os
 import re
@@ -205,16 +206,35 @@ def env_weeks(name: str) -> list[date]:
         sys.exit(f"{name} must be start dates like 2026-10-04,2026-11-02 (got {value!r})")
 
 
-def in_baseline(day: date, week_starts: list[date]) -> bool:
-    return any(start <= day < start + timedelta(days=7) for start in week_starts)
+# A true/false setting from .env (TOMTOM_BASELINE_MONTHLY, GOOGLE_BASELINE_MONTHLY), False if unset
+def env_flag(name: str) -> bool:
+    return config.parse_bool(config.env(name) or "")
 
 
-# Baseline weeks not over yet, e.g. "Mon 2026-11-02 to Sun 2026-11-08"
-def describe_weeks(week_starts: list[date], today: date) -> str:
-    return ", ".join(
-        f"{start:%a %Y-%m-%d} to {start + timedelta(days=6):%a %Y-%m-%d}"
-        for start in week_starts if start + timedelta(days=6) >= today
-    )
+# Start of the monthly baseline week in day's month: the month's first Monday, so the
+# week never runs into the next month and every month gets exactly one
+def monthly_week(day: date) -> date:
+    first = day.replace(day=1)
+    return first + timedelta(days=-first.weekday() % 7)
+
+
+# In a listed baseline week, or with monthly on, in the month's week from its first Monday
+def in_baseline(day: date, week_starts: list[date], monthly: bool = False) -> bool:
+    starts = week_starts + [monthly_week(day)] if monthly else week_starts
+    return any(start <= day < start + timedelta(days=7) for start in starts)
+
+
+def describe_weeks(week_starts: list[date], today: date, monthly: bool = False) -> str:
+    starts = {start for start in week_starts if start + timedelta(days=6) >= today}
+
+    if monthly:
+        start = monthly_week(today)
+        if start + timedelta(days=6) < today:
+            start = monthly_week(start.replace(day=28) + timedelta(days=7))
+        starts.add(start)
+
+    weeks = ", ".join(f"{start:%a %Y-%m-%d} to {start + timedelta(days=6):%a %Y-%m-%d}" for start in sorted(starts))
+    return f"{weeks}, then each month from its first Monday" if monthly else weeks
 
 
 # A local YYYY-MM-DD date from .env (GOOGLE_CREDITS_UNTIL, TOMTOM_WEEKDAYS_ONLY_UNTIL), or None
@@ -252,6 +272,25 @@ def google_plan(conn, day: date, credits_until: date | None) -> tuple[list[tuple
 # [("BEST_GUESS", True)] -> "best_guess (tolls)"
 def describe(queries: list[tuple[str, bool]]) -> str:
     return ", ".join(f"{model.lower()}{' (tolls)' if tolls else ''}" for model, tolls in queries)
+
+
+# At the first slot of a month: what the month just ended used, to set against the providers'
+# dashboards, and the new month's Google plan. Counts need no reset: api_usage has a row per
+# month, so each month starts from zero
+def log_new_month(conn, ended: str, day: date, credits_until: date | None):
+    used = {api: database.requests_by_month(conn, api).get(ended, 0) for api in ("tomtom_routing", "google_routes", "open_meteo")}
+    paid = max(0, used["google_routes"] - config.google_monthly_limit) * config.google_price_per_1000 / 1000
+
+    logger.info(
+        f"{ended} used: TomTom {used['tomtom_routing']:,} of {config.tomtom_free_per_month:,} free, "
+        f"Google {used['google_routes']:,} (${paid:,.2f} past the free {config.google_monthly_limit:,}), "
+        f"Open-Meteo {used['open_meteo']:,}"
+    )
+
+    queries, limit = google_plan(conn, day, credits_until)
+    spent = paid_requests(conn) * config.google_price_per_1000 / 1000
+    credits = f"; ${spent:,.2f} of the ${config.google_credit_budget:,.0f} credit budget used" if queries is google_credit_queries else ""
+    logger.info(f"{day:%Y-%m}: counts start from zero; Google {describe(queries)}, limit {limit:,}{credits}")
 
 
 def main():
@@ -292,16 +331,18 @@ def main():
         if config.env(old):
             logger.warning(f"{old} is no longer used and is ignored: set {new} to the start date of each baseline week")
 
-    # TomTom: around the clock in its baseline weeks, otherwise inside the windows every day,
-    # except weekends through TOMTOM_WEEKDAYS_ONLY_UNTIL (to make room in a month that has an
-    # extra baseline week). Worst case is a 31-day month, plus a baseline week's overnight slots
+    # TomTom: around the clock in its baseline weeks (listed, and with TOMTOM_BASELINE_MONTHLY
+    # the week from each month's first Monday), otherwise inside the windows every day, except
+    # weekends through TOMTOM_WEEKDAYS_ONLY_UNTIL (to make room in a month that has an extra
+    # baseline week). Worst case is a 31-day month, plus a baseline week's overnight slots
     tomtom_weeks = env_weeks("TOMTOM_BASELINE_WEEKS")
+    tomtom_monthly = env_flag("TOMTOM_BASELINE_MONTHLY")
     weekdays_only_until = env_date("TOMTOM_WEEKDAYS_ONLY_UNTIL")
     tomtom_per_slot = 2 if allow_tolls else 1
     tomtom_most = slots * tomtom_per_slot * config.max_days_per_month
     tomtom_week_extra = 7 * (24 * 60 // interval_min * len(all_legs) - slots) * tomtom_per_slot
 
-    if upcoming := describe_weeks(tomtom_weeks, date.today()):
+    if upcoming := describe_weeks(tomtom_weeks, date.today(), tomtom_monthly):
         logger.info(f"TomTom: around the clock {upcoming}; otherwise inside the windows every day")
     else:
         logger.info("TomTom: inside the windows every day")
@@ -319,13 +360,15 @@ def main():
     )
     if tomtom_most > tomtom_free:
         logger.warning("Over TomTom's free allowance: samples will fail late in long months. Narrow the WINDOW_* settings in .env")
-    elif tomtom_weeks and tomtom_most + tomtom_week_extra > tomtom_free:
+    elif (tomtom_weeks or tomtom_monthly) and tomtom_most + tomtom_week_extra > tomtom_free:
         logger.warning("A month with a baseline week can go over TomTom's free allowance: samples would fail late that month")
 
-    # Google: around the clock in its baseline weeks, otherwise weekdays inside the windows.
-    # Worst case is a 23-weekday month; past the limit, requests are refused
+    # Google: around the clock in its baseline weeks while trial credits last (the free 5,000
+    # can't hold one), otherwise weekdays inside the windows. Worst case is a 23-weekday month;
+    # past the limit, requests are refused
     google_key = config.env("GOOGLE_CLOUD_API_KEY")
     google_weeks = env_weeks("GOOGLE_BASELINE_WEEKS")
+    google_monthly = env_flag("GOOGLE_BASELINE_MONTHLY")
     credits_until = env_date("GOOGLE_CREDITS_UNTIL")
     queries, limit = google_plan(conn, date.today(), credits_until)
     on_credits = queries is google_credit_queries
@@ -335,9 +378,11 @@ def main():
         free = config.google_monthly_limit
         logger.info(f"Google Routes: inside the windows on weekdays ({used:,} requests used this month)")
 
-        if upcoming := describe_weeks(google_weeks, date.today()):
+        if (upcoming := describe_weeks(google_weeks, date.today(), google_monthly)) and on_credits:
             per_day = 24 * 60 // interval_min * len(all_legs) * len(queries)
-            logger.info(f"Google: around the clock every day {upcoming} (~{per_day:,} requests a day)")
+            logger.info(f"Google: around the clock every day {upcoming}, while trial credits last (~{per_day:,} requests a day)")
+        elif upcoming:
+            logger.info("Google: no baseline weeks without trial credits, as the free 5,000 a month can't hold one")
 
         if on_credits:
             credit_most = slots * len(google_credit_queries) * config.max_weekdays_per_month
@@ -364,6 +409,9 @@ def main():
     weather = WeatherCollector(conn, home, uni, api_key, interval_min)
     weather.log_plan()
 
+    # Real drives logged from Telegram (drives/), in a thread of its own; off without a token
+    drives.bot.start()
+
     # Freeway km and open-road time per route, for analysis; 4 requests once per home/uni pair
     profiled = route_profile.load_or_make(conn, home, uni, api_key)
 
@@ -382,6 +430,7 @@ def main():
 
     logger.info(f"First sample at {datetime.fromtimestamp(target):%a %Y-%m-%d %H:%M}")
     logger.info(f"Clock: {'synced by NTP' if clock_synced() else f'not synced by NTP yet, re-checking it every {max_sleep_s} s'}")
+    month = datetime.fromtimestamp(target).strftime("%Y-%m")
 
     while True:
         sleep_until(target)
@@ -395,20 +444,24 @@ def main():
         slot = datetime.fromtimestamp(target)
         in_window = legs_in_window(windowed_legs, slot)
 
+        # Last month's totals before this month's first request
+        if slot.strftime("%Y-%m") != month:
+            log_new_month(conn, month, slot.date(), credits_until)
+            month = slot.strftime("%Y-%m")
+
         # TomTom: every slot in its baseline weeks, otherwise only inside the windows
         # (and not on weekends through TOMTOM_WEEKDAYS_ONLY_UNTIL)
-        all_day = in_baseline(slot.date(), tomtom_weeks)
+        all_day = in_baseline(slot.date(), tomtom_weeks, tomtom_monthly)
         weekend_off = slot.weekday() >= 5 and weekdays_only_until is not None and slot.date() <= weekdays_only_until
 
         if all_day or not weekend_off:
             collect_samples(conn, all_legs if all_day else in_window, api_key, allow_tolls)
 
-        # Google: every slot in its baseline weeks, otherwise weekdays inside the windows
-        # (classes are Mon-Fri, and its allowance is tight)
-        google_all_day = in_baseline(slot.date(), google_weeks)
-
-        if google_key and (google_all_day or slot.weekday() < 5):
+        # Google: every slot in its baseline weeks while trial credits last, otherwise weekdays
+        # inside the windows (classes are Mon-Fri, and its allowance is tight)
+        if google_key:
             queries, limit = google_plan(conn, slot.date(), credits_until)
+            google_all_day = queries is google_credit_queries and in_baseline(slot.date(), google_weeks, google_monthly)
 
             # When trial credits end (date passed or budget used), Google drops to the free plan,
             # whose limit may already be used up this month; say so once, since its requests then
@@ -418,7 +471,8 @@ def main():
                 logger.info(f"Google trial credits ended: {describe(google_free_queries)} only, "
                             f"limit {config.google_monthly_limit:,} a month")
 
-            collect_google_samples(conn, all_legs if google_all_day else in_window, google_key, queries, limit)
+            if google_all_day or slot.weekday() < 5:
+                collect_google_samples(conn, all_legs if google_all_day else in_window, google_key, queries, limit)
 
         # After the drive times, so they keep their slot timing; logs failures, never raises
         weather.on_slot(slot)

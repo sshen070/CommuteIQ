@@ -11,12 +11,15 @@ max_weekdays_per_month: int = 23
 
 # Through GOOGLE_CREDITS_UNTIL (last day of the Google Cloud trial), Routes requests
 # past each month's free 5,000 are paid from the $300 trial credits, until this much
-# of them is used. Two baseline weeks plus the default windows need ~$236 over the
-# trial; past this, Google drops to the free plan instead of using the last of the $300
-google_credit_budget: float = 250.0
+# of them is used. A baseline week every month plus the default windows need ~$301
+# over the trial (Oct-Dec 2026), so Google stops at this budget on Dec 29 around 13:00,
+# in winter break, instead of reaching $300. $5 is kept as margin: requests are counted
+# before sending, and the count matched the Cloud Console within a day in October
+google_credit_budget: float = 295.0
 google_price_per_1000: float = 10.0     # Compute Routes Pro, past the free 5,000
 
-# TomTom answers 429 past its free monthly allowance, so samples would be lost until it resets
+# TomTom answers 403 past its free monthly allowance (counted by UTC month), so samples
+# would be lost until it resets
 tomtom_free_per_month: int = 20000
 max_days_per_month: int = 31
 
