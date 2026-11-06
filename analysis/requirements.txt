@@ -4,3 +4,6 @@ matplotlib
 
 # Read DB_PATH from .env
 python-dotenv
+
+# Send the nightly advice to Telegram (reports/daily_advice.py)
+requests
